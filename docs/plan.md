@@ -88,7 +88,8 @@ reverse-proxy/
 - 主分支 `main`；每阶段一条特性分支，验收通过后 `git merge --no-ff`。
 - 提交信息遵循 Conventional Commits：`feat(balancer): 支持平滑加权轮询`。
 - **每个 commit 必须保证 `go build ./...` 通过**。
-- tag 规划：`v0.1.0-scaffold` → `v0.2.0-mvp` → `v0.3.0-balancer` → `v0.4.0-health` → `v0.5.0-retry` → `v0.6.0-config` → `v0.7.0-test` → `v0.8.0-docs` → `v1.0.0`。
+- tag 规划：`v0.1.0-scaffold` → `v0.2.0-mvp` → `v0.3.0-balancer` → `v0.4.0-health` → `v0.5.0-retry` → `v0.6.0-cli` → `v0.7.0-docs` → `v0.8.0-test` → `v1.0.0`（限流 + Docker + 收尾）。
+  说明：阶段 7（设计文档）提前到阶段 6（测试补全）之前执行——功能已全部就位，趁热写文档比重读代码更省事。
 
 ## 六、阶段计划
 

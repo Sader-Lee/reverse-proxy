@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -52,20 +54,45 @@ func testBackend(t *testing.T, rawURL string, weight int) *backend.Backend {
 	return b
 }
 
-// newTestHandler 用给定后端构造轮询策略的处理器（不接健康检查）。
-func newTestHandler(t *testing.T, backends ...*backend.Backend) *Handler {
+// namedUpstream 起一个带实例名的后端；status 非 200 时固定返回该状态码。
+func namedUpstream(t *testing.T, name string, status int) *httptest.Server {
 	t.Helper()
-	return newTestHandlerWithReporter(t, nil, backends...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Instance", name)
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(name + ":" + strconv.Itoa(status)))
+			return
+		}
+		_, _ = w.Write([]byte(name))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
-// newTestHandlerWithReporter 允许注入失败上报器。
-func newTestHandlerWithReporter(t *testing.T, reporter HealthReporter, backends ...*backend.Backend) *Handler {
+// deadAddress 返回一个必然连接失败的后端地址。
+func deadAddress(t *testing.T) string {
 	t.Helper()
-	h, err := New(balancer.NewRoundRobin(backends), backend.NewRegistry(backends...), reporter, discardLogger())
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	addr := srv.URL
+	srv.Close()
+	return addr
+}
+
+// newTestHandlerWith 用给定后端构造处理器（不接健康检查）。
+func newTestHandlerWith(t *testing.T, reporter HealthReporter, opts Options, backends ...*backend.Backend) *Handler {
+	t.Helper()
+	h, err := New(balancer.NewRoundRobin(backends), backend.NewRegistry(backends...), reporter, opts, discardLogger())
 	if err != nil {
 		t.Fatalf("构造处理器失败: %v", err)
 	}
 	return h
+}
+
+// newTestHandler 构造单次尝试（不重试）的处理器。
+func newTestHandler(t *testing.T, backends ...*backend.Backend) *Handler {
+	t.Helper()
+	return newTestHandlerWith(t, nil, Options{}, backends...)
 }
 
 // newTestRouter 按与 main 一致的路由配置装配引擎：
@@ -82,13 +109,20 @@ func newTestRouter(t *testing.T, handler *Handler) *gin.Engine {
 	return router
 }
 
+// serve 通过 gin 路由发起一次请求。
+func serve(router *gin.Engine, req *http.Request) *closeNotifierRecorder {
+	w := newRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
 func TestNewRejectsNilDependencies(t *testing.T) {
 	backends := []*backend.Backend{testBackend(t, "http://127.0.0.1:9001", 1)}
 
-	if _, err := New(nil, backend.NewRegistry(backends...), nil, discardLogger()); err == nil {
+	if _, err := New(nil, backend.NewRegistry(backends...), nil, Options{}, discardLogger()); err == nil {
 		t.Error("负载均衡器为 nil 时应报错")
 	}
-	if _, err := New(balancer.NewRoundRobin(backends), nil, nil, discardLogger()); err == nil {
+	if _, err := New(balancer.NewRoundRobin(backends), nil, nil, Options{}, discardLogger()); err == nil {
 		t.Error("注册表为 nil 时应报错")
 	}
 }
@@ -124,8 +158,7 @@ func TestForwardsRequestAndSetsForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/api/users?page=2", strings.NewReader(`{"name":"lee"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", "1.2.3.4") // 客户端伪造的转发头应被丢弃
-	w := newRecorder()
-	router.ServeHTTP(w, req)
+	w := serve(router, req)
 
 	if w.Code != http.StatusCreated {
 		t.Errorf("状态码 = %d, 期望 %d", w.Code, http.StatusCreated)
@@ -176,7 +209,7 @@ func TestPreservesEncodedPath(t *testing.T) {
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/files/a%2Fb/c.txt", nil)
-	router.ServeHTTP(newRecorder(), req)
+	serve(router, req)
 
 	if gotRequestURI != "/files/a%2Fb/c.txt" {
 		t.Errorf("后端收到 RequestURI = %q, 期望 \"/files/a%%2Fb/c.txt\"（%%2F 不应被二次解码）", gotRequestURI)
@@ -194,7 +227,7 @@ func TestPreservesBackendBasePath(t *testing.T) {
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/svc", nil)
-	router.ServeHTTP(newRecorder(), req)
+	serve(router, req)
 
 	if gotPath != "/base/svc" {
 		t.Errorf("后端收到路径 = %q, 期望 \"/base/svc\"", gotPath)
@@ -202,15 +235,7 @@ func TestPreservesBackendBasePath(t *testing.T) {
 }
 
 func TestDistributesRequestsRoundRobin(t *testing.T) {
-	newUpstream := func(name string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Instance", name)
-			_, _ = w.Write([]byte(name))
-		}))
-	}
-	first, second := newUpstream("backend-a"), newUpstream("backend-b")
-	defer first.Close()
-	defer second.Close()
+	first, second := namedUpstream(t, "backend-a", http.StatusOK), namedUpstream(t, "backend-b", http.StatusOK)
 
 	handler := newTestHandler(t,
 		testBackend(t, first.URL, 1),
@@ -220,8 +245,7 @@ func TestDistributesRequestsRoundRobin(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 4; i++ {
-		w := newRecorder()
-		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/ping", nil))
+		w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/ping", nil))
 		got = append(got, w.Header().Get("X-Instance"))
 	}
 
@@ -232,17 +256,13 @@ func TestDistributesRequestsRoundRobin(t *testing.T) {
 }
 
 func TestReturnsBadGatewayWhenUpstreamUnreachable(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	target := upstream.URL
-	upstream.Close() // 立刻关闭，制造必然连不上的后端
-
+	target := deadAddress(t)
 	instance := testBackend(t, target, 1)
 	handler := newTestHandler(t, instance)
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/anything", nil)
-	w := newRecorder()
-	router.ServeHTTP(w, req)
+	w := serve(router, req)
 
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("状态码 = %d, 期望 502", w.Code)
@@ -269,8 +289,7 @@ func TestReturnsBadGatewayWhenUpstreamUnreachable(t *testing.T) {
 }
 
 func TestReturnsServiceUnavailableWhenNoHealthyBackend(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer upstream.Close()
+	upstream := namedUpstream(t, "backend-a", http.StatusOK)
 
 	instance := testBackend(t, upstream.URL, 1)
 	handler := newTestHandler(t, instance)
@@ -278,8 +297,7 @@ func TestReturnsServiceUnavailableWhenNoHealthyBackend(t *testing.T) {
 
 	instance.SetAlive(false)
 
-	w := newRecorder()
-	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/anything", nil))
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/anything", nil))
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("状态码 = %d, 期望 503", w.Code)
@@ -298,10 +316,7 @@ func TestReturnsServiceUnavailableWhenNoHealthyBackend(t *testing.T) {
 }
 
 func TestHandleWritesUpstreamToContext(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
+	upstream := namedUpstream(t, "backend-a", http.StatusOK)
 
 	instance := testBackend(t, upstream.URL, 1)
 	handler := newTestHandler(t, instance)
@@ -356,16 +371,12 @@ func (f *fakeReporter) reported() []*backend.Backend {
 }
 
 func TestReportsForwardFailureToReporter(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	target := upstream.URL
-	upstream.Close()
-
-	instance := testBackend(t, target, 1)
+	instance := testBackend(t, deadAddress(t), 1)
 	reporter := &fakeReporter{}
-	handler := newTestHandlerWithReporter(t, reporter, instance)
+	handler := newTestHandlerWith(t, reporter, Options{}, instance)
 
 	router := newTestRouter(t, handler)
-	router.ServeHTTP(newRecorder(), httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+	serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
 
 	reported := reporter.reported()
 	if len(reported) != 1 || reported[0] != instance {
@@ -374,12 +385,10 @@ func TestReportsForwardFailureToReporter(t *testing.T) {
 }
 
 func TestDoesNotCountClientCancellationAsFailure(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	defer upstream.Close()
-
+	upstream := namedUpstream(t, "backend-a", http.StatusOK)
 	instance := testBackend(t, upstream.URL, 1)
 	reporter := &fakeReporter{}
-	handler := newTestHandlerWithReporter(t, reporter, instance)
+	handler := newTestHandlerWith(t, reporter, Options{}, instance)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -392,5 +401,390 @@ func TestDoesNotCountClientCancellationAsFailure(t *testing.T) {
 	}
 	if stats := instance.Stats(); stats.Failures != 0 {
 		t.Errorf("客户端取消不应计入失败统计，实际 %d 次", stats.Failures)
+	}
+}
+
+func TestRetriesOnConnectionFailureWithAnotherBackend(t *testing.T) {
+	alive := namedUpstream(t, "backend-b", http.StatusOK)
+	dead := testBackend(t, deadAddress(t), 1)
+	live := testBackend(t, alive.URL, 1)
+
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 2}, dead, live)
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/retry", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（应重试到存活实例）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+	if stats := dead.Stats(); stats.Requests != 1 || stats.Failures != 1 {
+		t.Errorf("失败实例统计 = %+v, 期望 Requests=1 Failures=1", stats)
+	}
+	if stats := live.Stats(); stats.Requests != 1 || stats.Failures != 0 {
+		t.Errorf("成功实例统计 = %+v, 期望 Requests=1 Failures=0", stats)
+	}
+}
+
+func TestRetryStopsWhenNoMoreBackends(t *testing.T) {
+	// 三个实例全部不可达，只配两个尝试次数
+	instances := []*backend.Backend{
+		testBackend(t, deadAddress(t), 1),
+		testBackend(t, deadAddress(t), 1),
+		testBackend(t, deadAddress(t), 1),
+	}
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 2}, instances...)
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d, 期望 502", w.Code)
+	}
+	total := int64(0)
+	for _, b := range instances {
+		total += b.Stats().Requests
+	}
+	if total != 2 {
+		t.Errorf("总尝试次数 = %d, 期望 2", total)
+	}
+}
+
+func TestRetryExhaustedReturnsBadGateway(t *testing.T) {
+	instances := []*backend.Backend{
+		testBackend(t, deadAddress(t), 1),
+		testBackend(t, deadAddress(t), 1),
+		testBackend(t, deadAddress(t), 1),
+	}
+	reporter := &fakeReporter{}
+	handler := newTestHandlerWith(t, reporter, Options{MaxAttempts: 3}, instances...)
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d, 期望 502", w.Code)
+	}
+	if got := len(reporter.reported()); got != 3 {
+		t.Errorf("上报失败次数 = %d, 期望 3（每次尝试都记账）", got)
+	}
+	// 每次尝试都应换一个实例，不能重复打同一个坏实例
+	seen := map[*backend.Backend]bool{}
+	for _, b := range reporter.reported() {
+		if seen[b] {
+			t.Errorf("实例 %s 被重复尝试", b.String())
+		}
+		seen[b] = true
+	}
+}
+
+func TestRetriesOnRetryableStatus(t *testing.T) {
+	bad := namedUpstream(t, "backend-a", http.StatusServiceUnavailable)
+	good := namedUpstream(t, "backend-b", http.StatusOK)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   2,
+		RetryOnStatus: []int{http.StatusServiceUnavailable},
+	}, testBackend(t, bad.URL, 1), testBackend(t, good.URL, 1))
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（503 应触发换实例重试）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+}
+
+func TestRetriesOnClientErrorStatusWhenConfigured(t *testing.T) {
+	bad := namedUpstream(t, "backend-a", http.StatusNotFound)
+	good := namedUpstream(t, "backend-b", http.StatusOK)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   2,
+		RetryOnStatus: []int{http.StatusNotFound},
+	}, testBackend(t, bad.URL, 1), testBackend(t, good.URL, 1))
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（配置了 404 重试后应换实例）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+}
+
+func TestPassesThroughRetryableStatusWhenNoAttemptsLeft(t *testing.T) {
+	bad := namedUpstream(t, "backend-a", http.StatusServiceUnavailable)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   1,
+		RetryOnStatus: []int{http.StatusServiceUnavailable},
+	}, testBackend(t, bad.URL, 1))
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d, 期望 503（没有剩余尝试次数时应原样透传后端响应）", w.Code)
+	}
+	if w.Body.String() != "backend-a:503" {
+		t.Errorf("响应体 = %q, 期望透传后端响应体", w.Body.String())
+	}
+}
+
+func TestDoesNotRetryNonIdempotentOnRetryableStatus(t *testing.T) {
+	bad := namedUpstream(t, "backend-a", http.StatusServiceUnavailable)
+	good := namedUpstream(t, "backend-b", http.StatusOK)
+
+	goodInstance := testBackend(t, good.URL, 1)
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   2,
+		RetryOnStatus: []int{http.StatusServiceUnavailable},
+	}, testBackend(t, bad.URL, 1), goodInstance)
+	router := newTestRouter(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/order", strings.NewReader(`{"id":1}`))
+	w := serve(router, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d, 期望 503（非幂等方法默认不按状态码重试）", w.Code)
+	}
+	if stats := goodInstance.Stats(); stats.Requests != 0 {
+		t.Errorf("健康实例被请求 %d 次, 期望 0（不应重试）", stats.Requests)
+	}
+}
+
+func TestRetriesNonIdempotentOnDialError(t *testing.T) {
+	good := namedUpstream(t, "backend-b", http.StatusOK)
+
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 2},
+		testBackend(t, deadAddress(t), 1), testBackend(t, good.URL, 1))
+	router := newTestRouter(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/order", strings.NewReader(`{"id":1}`))
+	w := serve(router, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（连接都没建立起来时非幂等方法可以安全重试）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+}
+
+func TestRetriesNonIdempotentWhenEnabled(t *testing.T) {
+	bad := namedUpstream(t, "backend-a", http.StatusServiceUnavailable)
+	good := namedUpstream(t, "backend-b", http.StatusOK)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:        2,
+		RetryOnStatus:      []int{http.StatusServiceUnavailable},
+		RetryNonIdempotent: true,
+	}, testBackend(t, bad.URL, 1), testBackend(t, good.URL, 1))
+	router := newTestRouter(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/order", strings.NewReader(`{"id":1}`))
+	w := serve(router, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（开启后非幂等方法也应重试）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+}
+
+func TestRetryReplaysRequestBody(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		recorded = map[string][]string{}
+	)
+
+	upstream := func(name string, status int) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			recorded[name] = append(recorded[name], string(body))
+			mu.Unlock()
+
+			w.Header().Set("X-Instance", name)
+			w.WriteHeader(status)
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	bad := upstream("backend-a", http.StatusServiceUnavailable)
+	good := upstream("backend-b", http.StatusOK)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:        2,
+		RetryOnStatus:      []int{http.StatusServiceUnavailable},
+		RetryNonIdempotent: true,
+	}, testBackend(t, bad.URL, 1), testBackend(t, good.URL, 1))
+	router := newTestRouter(t, handler)
+
+	payload := `{"id":1}`
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/order", strings.NewReader(payload))
+	w := serve(router, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range []string{"backend-a", "backend-b"} {
+		bodies := recorded[name]
+		if len(bodies) != 1 {
+			t.Fatalf("%s 收到 %d 次请求, 期望 1", name, len(bodies))
+		}
+		if bodies[0] != payload {
+			t.Errorf("%s 收到的请求体 = %q, 期望 %q（重试必须重放完整请求体）", name, bodies[0], payload)
+		}
+	}
+}
+
+func TestPerTryTimeoutReturnsGatewayTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("too late"))
+	}))
+	t.Cleanup(slow.Close)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   1,
+		PerTryTimeout: 30 * time.Millisecond,
+	}, testBackend(t, slow.URL, 1))
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/slow", nil))
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("状态码 = %d, 期望 504", w.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("响应体不是合法 JSON: %v", err)
+	}
+	if payload["error"] != "gateway timeout" {
+		t.Errorf("响应中的 error = %v, 期望 \"gateway timeout\"", payload["error"])
+	}
+}
+
+func TestPerTryTimeoutFallsBackToOtherBackend(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = w.Write([]byte("slow"))
+	}))
+	t.Cleanup(slow.Close)
+	fast := namedUpstream(t, "backend-b", http.StatusOK)
+
+	slowInstance := testBackend(t, slow.URL, 1)
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   2,
+		PerTryTimeout: 50 * time.Millisecond,
+	}, slowInstance, testBackend(t, fast.URL, 1))
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/slow", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200（超时后应换实例重试）", w.Code)
+	}
+	if got := w.Header().Get("X-Instance"); got != "backend-b" {
+		t.Errorf("响应来自 %q, 期望 backend-b", got)
+	}
+	if stats := slowInstance.Stats(); stats.Failures != 1 {
+		t.Errorf("超时实例失败计数 = %d, 期望 1", stats.Failures)
+	}
+}
+
+func TestLargeBodyIsStreamedIntact(t *testing.T) {
+	var gotLen int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotLen = len(body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 3}, testBackend(t, upstream.URL, 1))
+	router := newTestRouter(t, handler)
+
+	// 超过 maxReplayBodyBytes 的请求体不会被缓冲，但仍必须完整转发
+	large := strings.Repeat("x", maxReplayBodyBytes+1024)
+	req := httptest.NewRequest(http.MethodPut, "http://proxy.example.com/upload", strings.NewReader(large))
+	w := serve(router, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", w.Code)
+	}
+	if gotLen != len(large) {
+		t.Errorf("后端收到请求体长度 = %d, 期望 %d（超限请求体应原样流式转发）", gotLen, len(large))
+	}
+}
+
+func TestReadReplayBody(t *testing.T) {
+	t.Run("无请求体", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil)
+		body, replayable := readReplayBody(req)
+		if !replayable || len(body) != 0 {
+			t.Errorf("无请求体时应返回 (空, true)，实际 (%q, %v)", body, replayable)
+		}
+	})
+
+	t.Run("小请求体可重放", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/x", strings.NewReader("payload"))
+		body, replayable := readReplayBody(req)
+		if !replayable || string(body) != "payload" {
+			t.Errorf("应返回 (payload, true)，实际 (%q, %v)", body, replayable)
+		}
+	})
+
+	t.Run("超大请求体不可重放但流仍完整", func(t *testing.T) {
+		payload := strings.Repeat("y", maxReplayBodyBytes+1)
+		req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/x", strings.NewReader(payload))
+
+		body, replayable := readReplayBody(req)
+		if replayable || body != nil {
+			t.Errorf("超限时应返回 (nil, false)，实际 (%v, %v)", body, replayable)
+		}
+
+		// r.Body 已被拼回完整流，转发仍能读到全部内容
+		rest, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("读取拼回的请求体失败: %v", err)
+		}
+		if string(rest) != payload {
+			t.Errorf("拼回的请求体长度 = %d, 期望 %d", len(rest), len(payload))
+		}
+	})
+}
+
+func TestIsIdempotent(t *testing.T) {
+	idempotent := []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace}
+	nonIdempotent := []string{http.MethodPost, http.MethodPatch, "CUSTOM"}
+
+	for _, method := range idempotent {
+		if !isIdempotent(method) {
+			t.Errorf("%s 应被视为幂等", method)
+		}
+	}
+	for _, method := range nonIdempotent {
+		if isIdempotent(method) {
+			t.Errorf("%s 不应被视为幂等", method)
+		}
 	}
 }

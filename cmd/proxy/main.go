@@ -65,7 +65,12 @@ func run() error {
 
 	checker := health.New(registry, cfg.HealthCheck, logger)
 
-	handler, err := proxy.New(lb, registry, checker, logger)
+	handler, err := proxy.New(lb, registry, checker, proxy.Options{
+		MaxAttempts:        cfg.Retry.MaxAttempts,
+		PerTryTimeout:      cfg.Retry.PerTryTimeout.Duration(),
+		RetryOnStatus:      cfg.Retry.RetryOnStatus,
+		RetryNonIdempotent: cfg.Retry.RetryNonIdempotent,
+	}, logger)
 	if err != nil {
 		return err
 	}

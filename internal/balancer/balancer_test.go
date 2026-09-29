@@ -240,6 +240,56 @@ func TestWeightedRoundRobinReturnsNilWhenAllDown(t *testing.T) {
 	}
 }
 
+func TestStrategiesSkipExcludedBackends(t *testing.T) {
+	for _, strategy := range []string{NameRoundRobin, NameRandom, NameWeightedRoundRobin} {
+		t.Run(strategy, func(t *testing.T) {
+			backends := testBackends(t, 2)
+			lb, err := New(strategy, backends)
+			if err != nil {
+				t.Fatalf("构造均衡器失败: %v", err)
+			}
+
+			// 排除第一个后只剩第二个可选（重试换实例就依赖这个行为）
+			for i := 0; i < 10; i++ {
+				if got := lb.Next(backends[0]); got != backends[1] {
+					t.Fatalf("第 %d 次 = %v, 期望 %v", i, got, backends[1])
+				}
+			}
+
+			if got := lb.Next(backends[0], backends[1]); got != nil {
+				t.Errorf("全部被排除时应返回 nil，实际 %v", got)
+			}
+			if got := lb.Next(); got == nil {
+				t.Error("不排除任何实例时不应返回 nil")
+			}
+		})
+	}
+}
+
+func TestWeightedRoundRobinKeepsProgressWhenExcluded(t *testing.T) {
+	backends := []*backend.Backend{
+		testBackend(t, "http://127.0.0.1:9001", 3),
+		testBackend(t, "http://127.0.0.1:9002", 1),
+	}
+	lb := NewWeightedRoundRobin(backends)
+
+	if got := lb.Next(); got != backends[0] {
+		t.Fatalf("第 1 次 = %v, 期望 %v", got, backends[0])
+	}
+	// 排除第一个（相当于重试时跳过已失败的实例）
+	if got := lb.Next(backends[0]); got != backends[1] {
+		t.Fatalf("排除后 = %v, 期望 %v", got, backends[1])
+	}
+	// 恢复后仍应按 3:1 的节奏分配
+	counts := distribution(t, lb, 60)
+	if got := counts[backends[0].String()]; got != 45 {
+		t.Errorf("高权重实例被选中 %d 次, 期望 45 次（3:1）", got)
+	}
+	if got := counts[backends[1].String()]; got != 15 {
+		t.Errorf("低权重实例被选中 %d 次, 期望 15 次（3:1）", got)
+	}
+}
+
 func TestAllStrategiesAreConcurrencySafe(t *testing.T) {
 	for _, strategy := range []string{NameRoundRobin, NameRandom, NameWeightedRoundRobin} {
 		t.Run(strategy, func(t *testing.T) {

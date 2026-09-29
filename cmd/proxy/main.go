@@ -1,7 +1,7 @@
 // Command proxy 是反向代理与负载均衡器的入口。
 //
-// 阶段 1：基于 Gin + httputil.ReverseProxy 把请求转发到配置中的后端实例，
-// 并记录访问日志；多后端负载均衡、健康检查与超时重试在后续阶段接入。
+// 阶段 2：基于 Gin + httputil.ReverseProxy，按配置的负载均衡策略把请求分发到
+// 多个后端实例；健康检查与超时重试在后续阶段接入。
 package main
 
 import (
@@ -20,6 +20,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Sader-Lee/reverse-proxy/internal/backend"
+	"github.com/Sader-Lee/reverse-proxy/internal/balancer"
 	"github.com/Sader-Lee/reverse-proxy/internal/config"
 	"github.com/Sader-Lee/reverse-proxy/internal/middleware"
 	"github.com/Sader-Lee/reverse-proxy/internal/proxy"
@@ -44,14 +46,23 @@ func run() error {
 	logger := newLogger(cfg.Logging)
 	slog.SetDefault(logger)
 
-	// 阶段 1 只转发到配置中的第一个后端，多实例负载均衡在阶段 2 接入。
-	target := cfg.Backends[0].URL
-	if len(cfg.Backends) > 1 {
-		logger.Warn("当前阶段仅使用第一个后端，其余实例暂未参与转发",
-			"using", target, "configured", len(cfg.Backends))
+	// 按配置构造后端实例，并初始化负载均衡器
+	backends := make([]*backend.Backend, 0, len(cfg.Backends))
+	for _, bc := range cfg.Backends {
+		b, err := backend.New(bc.URL, bc.Weight)
+		if err != nil {
+			return err
+		}
+		backends = append(backends, b)
+	}
+	registry := backend.NewRegistry(backends...)
+
+	lb, err := balancer.New(string(cfg.Strategy), registry.All())
+	if err != nil {
+		return err
 	}
 
-	handler, err := proxy.New(target, logger)
+	handler, err := proxy.New(lb, registry, logger)
 	if err != nil {
 		return err
 	}
@@ -68,10 +79,14 @@ func run() error {
 		IdleTimeout:       cfg.Timeouts.Idle.Duration(),
 	}
 
+	for _, b := range registry.All() {
+		logger.Info("后端实例", "url", b.String(), "weight", b.Weight(), "alive", b.Alive())
+	}
 	logger.Info("反向代理已启动",
 		"listen", listener.Addr().String(),
-		"target", handler.Target(),
-		"strategy", string(cfg.Strategy),
+		"strategy", lb.Name(),
+		"backends", registry.Len(),
+		"healthy", registry.HealthyLen(),
 		"health_check", cfg.HealthCheck.Enabled,
 		"config", *configPath,
 	)

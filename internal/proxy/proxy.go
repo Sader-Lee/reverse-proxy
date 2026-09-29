@@ -1,73 +1,75 @@
 // Package proxy 负责把客户端请求转发到后端实例。
 //
-// 阶段 1 基于 httputil.ReverseProxy 实现固定后端透传；多后端选择、健康检查与
-// 超时重试分别在阶段 2、3、4 接入。
+// 转发目标由负载均衡器在每次请求时选出：后端不可达回写 502，
+// 没有可用实例时回写 503。
 package proxy
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Sader-Lee/reverse-proxy/internal/backend"
+	"github.com/Sader-Lee/reverse-proxy/internal/balancer"
 )
 
 // CtxKeyUpstream 是写入 gin.Context 的键，值为本次请求实际转发到的后端地址，
 // 供访问日志等中间件读取。
 const CtxKeyUpstream = "proxy.upstream"
 
-// badGatewayMessage 是后端不可达时返回给客户端的错误标识。
-const badGatewayMessage = "bad gateway"
+const (
+	badGatewayMessage = "bad gateway"
+	noBackendMessage  = "no healthy backend"
+)
 
-// Handler 把收到的 HTTP 请求转发到后端实例。
+// targetCtxKey 是在请求 context 中携带本次选中后端实例的键。
+type targetCtxKey struct{}
+
+// Handler 把收到的 HTTP 请求转发到负载均衡器选出的后端实例。
 type Handler struct {
-	target *url.URL
-	proxy  *httputil.ReverseProxy
-	logger *slog.Logger
+	balancer balancer.Balancer
+	registry *backend.Registry
+	proxy    *httputil.ReverseProxy
+	logger   *slog.Logger
 }
 
-// New 构造一个把请求固定转发到 target 的处理器。
-// target 需为 http/https 形式的完整地址，例如 http://127.0.0.1:9001。
-func New(target string, logger *slog.Logger) (*Handler, error) {
-	t, err := parseTarget(target)
-	if err != nil {
-		return nil, err
+// New 构造转发处理器。
+func New(lb balancer.Balancer, registry *backend.Registry, logger *slog.Logger) (*Handler, error) {
+	if lb == nil {
+		return nil, errors.New("负载均衡器不能为空")
+	}
+	if registry == nil {
+		return nil, errors.New("后端注册表不能为空")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	h := &Handler{target: t, logger: logger}
+	h := &Handler{balancer: lb, registry: registry, logger: logger}
 
-	rp := httputil.NewSingleHostReverseProxy(t)
-	baseDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		scheme := "http"
-		if req.TLS != nil {
-			scheme = "https"
-		}
-		originalHost := req.Host
-
-		// 改写 scheme/host/path（内部会保留原始 RawPath，避免 %2F 等编码丢失）
-		baseDirector(req)
-
-		// 让后端收到自己期望的 Host，而不是客户端请求代理时用的 Host
-		req.Host = t.Host
-		req.Header.Set("X-Forwarded-Proto", scheme)
-		req.Header.Set("X-Forwarded-Host", originalHost)
-		// X-Forwarded-For 由 ReverseProxy 自动追加，业务侧无需处理
+	rp := &httputil.ReverseProxy{
+		// 用 Rewrite（Go 1.20+）而不是 Director：它会先丢弃客户端伪造的
+		// X-Forwarded-* 头，再由 SetXForwarded 写入可信值，避免头部欺骗。
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			target := targetFrom(pr.In.Context())
+			if target == nil {
+				return // 理论上不可达：Handle 已保证选好实例
+			}
+			targetURL := target.URL()
+			// SetURL 会改写 scheme/host/path（保留原始 RawPath 编码），并把 Host 头指向目标
+			pr.SetURL(targetURL)
+			pr.SetXForwarded()
+		},
+		Transport:     newTransport(),
+		FlushInterval: 100 * time.Millisecond,
 	}
-
-	// 周期性 flush：兼顾大响应吞吐与流式场景（event-stream 由标准库单独处理）
-	rp.FlushInterval = 100 * time.Millisecond
-	rp.Transport = newTransport()
 	rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
 		h.handleUpstreamError(w, req, err)
 	}
@@ -76,30 +78,67 @@ func New(target string, logger *slog.Logger) (*Handler, error) {
 	return h, nil
 }
 
-// ServeHTTP 实现 http.Handler，便于在不依赖 Gin 的场景下直接使用。
+// ServeHTTP 实现 http.Handler，便于在不依赖 Gin 的场景下使用。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.proxy.ServeHTTP(w, r)
+	target := h.balancer.Next()
+	if target == nil {
+		h.writeNoHealthyBackend(w)
+		return
+	}
+
+	target.RecordRequest()
+	h.proxy.ServeHTTP(w, r.WithContext(withTarget(r.Context(), target)))
 }
 
-// Handle 是 Gin 处理器版本：额外把转发目标写入上下文，供访问日志记录。
+// Handle 是 Gin 处理器入口：先选后端，再交给 ReverseProxy 转发。
 func (h *Handler) Handle(c *gin.Context) {
-	c.Set(CtxKeyUpstream, h.target.String())
-	h.proxy.ServeHTTP(c.Writer, c.Request)
+	target := h.balancer.Next()
+	if target == nil {
+		h.writeNoHealthyBackend(c.Writer)
+		return
+	}
+
+	target.RecordRequest()
+	c.Set(CtxKeyUpstream, target.String())
+	h.proxy.ServeHTTP(c.Writer, c.Request.WithContext(withTarget(c.Request.Context(), target)))
 }
 
-// Target 返回当前固定转发的后端地址。
-func (h *Handler) Target() string {
-	return h.target.String()
+// withTarget 把选中的后端实例放进请求 context。
+func withTarget(ctx context.Context, target *backend.Backend) context.Context {
+	return context.WithValue(ctx, targetCtxKey{}, target)
 }
 
-// handleUpstreamError 在转发失败（连接失败、超时等）时回写 502。
+// targetFrom 取出本次请求选中的后端实例。
+func targetFrom(ctx context.Context) *backend.Backend {
+	target, _ := ctx.Value(targetCtxKey{}).(*backend.Backend)
+	return target
+}
+
+// writeNoHealthyBackend 在没有任何存活实例时回写 503。
+func (h *Handler) writeNoHealthyBackend(w http.ResponseWriter) {
+	total := h.registry.Len()
+	h.logger.Warn("没有可用的后端实例", "total", total)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"error":          noBackendMessage,
+		"total_backends": total,
+	}, h.logger)
+}
+
+// handleUpstreamError 在转发失败（连接失败、超时等）时累计失败次数并回写 502。
 func (h *Handler) handleUpstreamError(w http.ResponseWriter, req *http.Request, err error) {
+	target := targetFrom(req.Context())
+	upstream := "unknown"
+	if target != nil {
+		upstream = target.String()
+		target.RecordFailure() // 累计失败次数，供健康检查与统计使用
+	}
+
 	// 客户端主动取消请求不是后端故障，无需回写响应
 	if errors.Is(err, context.Canceled) {
 		h.logger.Debug("客户端取消请求",
 			"method", req.Method,
 			"path", req.URL.Path,
-			"upstream", h.target.String(),
+			"upstream", upstream,
 		)
 		return
 	}
@@ -107,23 +146,28 @@ func (h *Handler) handleUpstreamError(w http.ResponseWriter, req *http.Request, 
 	h.logger.Warn("转发失败",
 		"method", req.Method,
 		"path", req.URL.Path,
-		"upstream", h.target.String(),
+		"upstream", upstream,
 		"err", err.Error(),
 	)
 
-	body, marshalErr := json.Marshal(map[string]string{
+	writeJSON(w, http.StatusBadGateway, map[string]string{
 		"error":    badGatewayMessage,
-		"upstream": h.target.String(),
-	})
-	if marshalErr != nil {
-		http.Error(w, badGatewayMessage, http.StatusBadGateway)
+		"upstream": upstream,
+	}, h.logger)
+}
+
+// writeJSON 回写 JSON 响应。
+func writeJSON(w http.ResponseWriter, status int, payload any, logger *slog.Logger) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		http.Error(w, http.StatusText(status), status)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusBadGateway)
-	if _, writeErr := w.Write(body); writeErr != nil {
-		h.logger.Debug("回写错误响应失败", "err", writeErr.Error())
+	w.WriteHeader(status)
+	if _, err := w.Write(body); err != nil {
+		logger.Debug("回写响应失败", "err", err.Error())
 	}
 }
 
@@ -143,19 +187,4 @@ func newTransport() *http.Transport {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-}
-
-// parseTarget 解析并校验后端地址。
-func parseTarget(target string) (*url.URL, error) {
-	t, err := url.Parse(target)
-	if err != nil {
-		return nil, fmt.Errorf("解析后端地址 %q 失败: %w", target, err)
-	}
-	if t.Scheme != "http" && t.Scheme != "https" {
-		return nil, fmt.Errorf("后端地址 %q 的 scheme 必须是 http 或 https", target)
-	}
-	if t.Host == "" {
-		return nil, fmt.Errorf("后端地址 %q 缺少主机名", target)
-	}
-	return t, nil
 }

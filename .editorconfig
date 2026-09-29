@@ -1,0 +1,20 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go 使用 tab 缩进
+[*.go]
+indent_style = tab
+
+[Makefile]
+indent_style = tab
+
+# Markdown 中行尾两个空格表示换行，不清理
+[*.md]
+trim_trailing_whitespace = false

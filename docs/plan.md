@@ -1,6 +1,6 @@
 # 反向代理与负载均衡器 — 实施计划
 
-> 技术栈：Go 1.26 + Gin + net/http/httputil.ReverseProxy
+> 技术栈：Go 1.25 + Gin + net/http/httputil.ReverseProxy
 > 模块路径：`github.com/Sader-Lee/reverse-proxy`
 > 配置格式：YAML
 > 分支策略：每阶段一条特性分支，验收后 `git merge --no-ff` 合入 `main` 并打 tag
@@ -22,8 +22,13 @@
 
 ## 二、可选模块范围（已确认）
 
-- 做：**限流**（令牌桶）、**Docker 部署**（Dockerfile + docker-compose.yml）
-- 不做：Web 管理界面、HTTPS 终止
+- 做：**限流**（令牌桶）
+- 不做：Docker 部署、Web 管理界面、HTTPS 终止
+
+> Docker 部署曾以 `feat/docker` 分支实现（多阶段 `Dockerfile` + `.dockerignore` +
+> `docker-compose.yml`），但本机拉取基础镜像只有约 0.05 MB/s，无法完成镜像构建验证；
+> 且它不属于题面要求，因此按「不交付未验证的东西」原则，已在 `chore/remove-docker`
+> 分支中整体移除（相关文档与目录树同步清理）。
 
 ## 三、架构设计
 
@@ -77,8 +82,6 @@ reverse-proxy/
 │   ├── plan.md                       # 本文件
 │   └── design.md                     # 交付要求 8
 ├── test/e2e_test.go                  # httptest 多后端端到端测试
-├── Dockerfile                        # 可选模块
-├── docker-compose.yml                # 可选模块
 ├── Makefile
 └── README.md
 ```
@@ -88,9 +91,9 @@ reverse-proxy/
 - 主分支 `main`；每阶段一条特性分支，验收通过后 `git merge --no-ff`。
 - 提交信息遵循 Conventional Commits：`feat(balancer): 支持平滑加权轮询`。
 - **每个 commit 必须保证 `go build ./...` 通过**。
-- tag 规划：`v0.1.0-scaffold` → `v0.2.0-mvp` → `v0.3.0-balancer` → `v0.4.0-health` → `v0.5.0-retry` → `v0.6.0-cli` → `v0.7.0-docs` → `v0.8.0-test` → `v0.9.0-ratelimit` → `v1.0.0`（Docker + 收尾）。
+- tag 规划：`v0.1.0-scaffold` → `v0.2.0-mvp` → `v0.3.0-balancer` → `v0.4.0-health` → `v0.5.0-retry` → `v0.6.0-cli` → `v0.7.0-docs` → `v0.8.0-test` → `v0.9.0-ratelimit` → `v1.0.0`（收尾）。
   说明：阶段 7（设计文档）提前到阶段 6（测试补全）之前执行——功能已全部就位，趁热写文档比重读代码更省事；
-  阶段 8 拆为 8a（限流，已完成）与 8b（Docker）：8b 的构建文件已提供，但受本机拉取基础镜像速度限制（约 0.05 MB/s），未做实跑验证。
+  阶段 8 最终只保留限流（`feat/ratelimit`），Docker 部分已移除（原因见第二节）。
 
 ## 六、阶段计划
 
@@ -104,7 +107,7 @@ reverse-proxy/
 | 5   | 最小 CLI   | `feat/config-cli`               | 仅 `-config` / `-check` / `-version` / `-listen`，不重复配置字段 | `-check` 能报出配置问题；`-version` 能区分构建                         |
 | 6   | 测试补全   | `test/coverage`                 | 核心逻辑边界用例（负载均衡/健康检查/超时重试）                   | 三个核心包覆盖率 94.8%–98.3%；不给装配代码造测试                       |
 | 7   | 设计文档   | `docs/design`                   | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制   | 按文档从零启动一次成功                                                 |
-| 8   | 可选模块   | `feat/ratelimit`、`feat/docker` | 8a 令牌桶限流；8b Dockerfile + docker-compose                    | 突发放行后 429 + `Retry-After`；`docker compose up` 一键起代理与多后端 |
+| 8   | 可选模块   | `feat/ratelimit`                | 令牌桶限流（按 IP / 全局，超限 429 + `Retry-After`）            | 突发放行后 429；换源 IP 独立计数；1.2s 后按 rps 补齐令牌             |
 
 ### 每阶段固定收尾动作
 

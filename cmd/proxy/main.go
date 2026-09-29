@@ -1,7 +1,14 @@
 // Command proxy 是反向代理与负载均衡器的入口。
 //
-// 阶段 3：在负载均衡的基础上加入后端健康检查（主动探测 + 转发失败被动上报），
-// 实例被剔除后自动跳过，恢复后重新加入；超时与重试在后续阶段接入。
+// 支持的最小 CLI：
+//
+//	-config   指定配置文件（必选，其他参数都是可选的）
+//	-check    只校验配置并退出
+//	-version  打印版本信息并退出
+//	-listen   覆盖配置中的监听地址
+//
+// 其余可调项（后端列表、策略、健康检查、重试等）一律由配置文件提供，
+// 避免同一份配置出现两个来源。
 package main
 
 import (
@@ -29,19 +36,42 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
+	opts, err := parseFlags(os.Args[1:], os.Stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return // -h / --help：flag 包已打印用法
+		}
+		os.Exit(2)
+	}
+
+	if err := run(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	configPath := flag.String("config", config.DefaultConfigPath, "配置文件路径（YAML）")
-	flag.Parse()
+func run(opts options) error {
+	if opts.showVersion {
+		fmt.Fprint(stdout, versionText())
+		return nil
+	}
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		return err
+	}
+
+	if listen := strings.TrimSpace(opts.listen); listen != "" {
+		// 命令行覆盖监听地址后重新校验，避免绕过配置约束
+		cfg.Listen = listen
+		if err := cfg.Validate(); err != nil {
+			return fmt.Errorf("-listen 覆盖后的配置非法: %w", err)
+		}
+	}
+
+	if opts.checkOnly {
+		fmt.Fprint(stdout, configSummary(opts.configPath, cfg))
+		return nil
 	}
 
 	logger := newLogger(cfg.Logging)
@@ -103,7 +133,7 @@ func run() error {
 		"backends", registry.Len(),
 		"healthy", registry.HealthyLen(),
 		"health_check", checker.Enabled(),
-		"config", *configPath,
+		"config", opts.configPath,
 	)
 
 	serveErr := make(chan error, 1)

@@ -51,11 +51,34 @@ curl -s "http://127.0.0.1:8080/api/users?page=2"
 也可以用 Makefile：
 
 ```bash
-make build      # 编译到 bin/proxy
+make build      # 编译到 bin/proxy（自动注入版本、commit、构建时间）
 make run        # 编译并启动
+make check      # 只校验配置文件，不启动服务
+make version    # 打印版本信息
 make race       # 开启竞态检测运行测试
 make cover      # 生成覆盖率报告
 ```
+
+## 命令行参数
+
+命令行只提供**配置文件不具备**的能力，不重复配置字段：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-config <path>` | 配置文件路径，默认 `configs/config.yaml` |
+| `-check` | 只加载并校验配置，打印生效配置摘要后退出（适合 CI / 上线前自检） |
+| `-version` | 打印版本、commit、构建时间后退出 |
+| `-listen <addr>` | 覆盖配置中的监听地址，例如 `-listen :9090`（留空则不覆盖） |
+
+```bash
+go run ./cmd/proxy -check -config configs/config.yaml
+go run ./cmd/proxy -config configs/config.yaml -listen :9090
+```
+
+退出码：`0` 正常（含 `-h`）、`1` 配置或启动失败、`2` 命令行参数错误。
+
+版本信息有两个来源：`go build` 时 Go 会自动写入 git 信息（含工作区是否有未提交改动）；
+也可以通过 `-ldflags` 注入，`make build` 已接好。
 
 ## 配置文件
 
@@ -179,7 +202,7 @@ go test ./... -cover    # 覆盖率
 - [x] **阶段 2** 负载均衡策略（轮询 / 随机 / 平滑加权轮询，自动跳过不可用实例）
 - [x] **阶段 3** 健康检查（主动探测 + 被动失败剔除，阈值防抖，自动恢复）
 - [x] **阶段 4** 超时与重试（单次尝试超时 504、按状态码/连接失败换实例重试、请求体重放）
-- [ ] **阶段 5** CLI 与配置完善
+- [x] **阶段 5** 最小 CLI（`-config` / `-check` / `-version` / `-listen`，退出码约定，版本信息注入）
 - [ ] **阶段 6** 单元测试补全
 - [ ] **阶段 7** 设计文档
 - [ ] **阶段 8** 限流与 Docker 部署

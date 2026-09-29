@@ -1,0 +1,53 @@
+# 反向代理与负载均衡器 配置示例
+# 复制为 configs/config.yaml 后按需修改：
+#   cp configs/config.example.yaml configs/config.yaml
+# 启动：
+#   ./bin/proxy -config configs/config.yaml
+
+# 代理监听地址
+listen: ":8080"
+
+# 负载均衡策略：round-robin | random | weighted-round-robin
+strategy: "weighted-round-robin"
+
+# 后端实例列表，weight 仅在 weighted-round-robin 策略下生效
+backends:
+  - url: "http://127.0.0.1:9001"
+    weight: 3
+  - url: "http://127.0.0.1:9002"
+    weight: 1
+
+# 健康检查
+health_check:
+  enabled: true
+  path: "/healthz"
+  interval: "5s"
+  timeout: "2s"
+  failure_threshold: 3   # 连续失败 N 次标记 DOWN
+  success_threshold: 2   # 连续成功 M 次标记 UP
+
+# 超时与重试
+retry:
+  max_attempts: 3                  # 含首次请求的总尝试次数
+  per_try_timeout: "3s"            # 单次尝试超时
+  retry_on_status: [502, 503, 504] # 命中这些状态码时换实例重试
+  retry_non_idempotent: false      # 是否允许非幂等方法在读响应前重试
+
+# 限流（令牌桶）
+rate_limit:
+  enabled: false
+  rps: 1000
+  burst: 200
+  by: "ip"   # ip | global
+
+# 日志
+logging:
+  level: "info"    # debug | info | warn | error
+  format: "json"   # json | text
+  access_log: true
+
+# 服务端超时
+timeouts:
+  read_header: "10s"
+  write: "0s"      # 0 表示不限制，支持流式/SSE 响应
+  idle: "90s"

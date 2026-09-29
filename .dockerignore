@@ -1,0 +1,18 @@
+# 构建上下文裁剪：不要把仓库历史、本地产物与本地配置打进镜像
+.git
+.gitignore
+.history
+.vscode
+.idea
+bin
+coverage*
+*.local.yaml
+*.out
+docs
+README.md
+Makefile
+Dockerfile
+docker-compose.yml
+.dockerignore
+.editorconfig
+.gitattributes

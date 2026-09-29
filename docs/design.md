@@ -24,16 +24,16 @@
 
 实现一个 HTTP 反向代理与负载均衡器，满足：
 
-| # | 要求 | 实现位置 |
-| --- | --- | --- |
-| 1 | 监听端口接收客户端请求 | `cmd/proxy` + `gin.Engine` |
-| 2 | 按配置转发到多个后端实例 | `internal/proxy` |
-| 3 | ≥2 种负载均衡策略 | `internal/balancer`（3 种） |
-| 4 | 健康检查，自动剔除与恢复 | `internal/health` |
-| 5 | 请求超时、重试、访问日志 | `internal/proxy` + `internal/middleware` |
-| 6 | CLI / 配置文件启动 | `internal/config` + `cmd/proxy/cli.go` |
-| 7 | 单元测试覆盖核心逻辑 | 各包 `*_test.go` |
-| 8 | 设计文档 | 本文 |
+| #   | 要求                     | 实现位置                                 |
+| --- | ------------------------ | ---------------------------------------- |
+| 1   | 监听端口接收客户端请求   | `cmd/proxy` + `gin.Engine`               |
+| 2   | 按配置转发到多个后端实例 | `internal/proxy`                         |
+| 3   | ≥2 种负载均衡策略        | `internal/balancer`（3 种）              |
+| 4   | 健康检查，自动剔除与恢复 | `internal/health`                        |
+| 5   | 请求超时、重试、访问日志 | `internal/proxy` + `internal/middleware` |
+| 6   | CLI / 配置文件启动       | `internal/config` + `cmd/proxy/cli.go`   |
+| 7   | 单元测试覆盖核心逻辑     | 各包 `*_test.go`                         |
+| 8   | 设计文档                 | 本文                                     |
 
 **明确不做**：动态路由规则、请求改写插件、TLS 终止、Web 管理界面（除已约定的限流与 Docker 外）。
 
@@ -93,15 +93,15 @@ flowchart LR
 
 ### 2.3 模块职责
 
-| 包 | 职责 | 关键类型 |
-| --- | --- | --- |
-| `internal/config` | YAML 加载、默认值填充、规范化、聚合校验 | `Config`、`Duration` |
-| `internal/backend` | 后端实例模型（URL/权重/存活状态/统计）与注册表 | `Backend`、`Registry`、`Stats` |
-| `internal/balancer` | 三种负载均衡策略，支持排除已尝试实例 | `Balancer`、`roundRobin`、`random`、`weightedRoundRobin` |
-| `internal/health` | 主动定时探测 + 被动失败上报，阈值防抖地维护存活状态 | `Checker` |
-| `internal/proxy` | 转发内核：逐请求选实例、单次超时、换实例重试、错误回写 | `Handler`、`Options`、`attemptState` |
-| `internal/middleware` | 访问日志与令牌桶限流（Gin 中间件） | `AccessLog`、`RateLimit` |
-| `cmd/proxy` | 入口：命令行解析、依赖装配、监听与优雅退出 | `options`、`run` |
+| 包                    | 职责                                                   | 关键类型                                                 |
+| --------------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| `internal/config`     | YAML 加载、默认值填充、规范化、聚合校验                | `Config`、`Duration`                                     |
+| `internal/backend`    | 后端实例模型（URL/权重/存活状态/统计）与注册表         | `Backend`、`Registry`、`Stats`                           |
+| `internal/balancer`   | 三种负载均衡策略，支持排除已尝试实例                   | `Balancer`、`roundRobin`、`random`、`weightedRoundRobin` |
+| `internal/health`     | 主动定时探测 + 被动失败上报，阈值防抖地维护存活状态    | `Checker`                                                |
+| `internal/proxy`      | 转发内核：逐请求选实例、单次超时、换实例重试、错误回写 | `Handler`、`Options`、`attemptState`                     |
+| `internal/middleware` | 访问日志与令牌桶限流（Gin 中间件）                     | `AccessLog`、`RateLimit`                                 |
+| `cmd/proxy`           | 入口：命令行解析、依赖装配、监听与优雅退出             | `options`、`run`                                         |
 
 ### 2.4 限流
 
@@ -115,48 +115,62 @@ flowchart LR
   否则伪造头部就能换一个新桶绕过限流；
 - 配置非法（`rps <= 0` 或 `burst < 1`）时跳过限流并打警告，而不是把请求全部拒绝（fail-open）。
 
+### 2.5 部署形态
+
+`Dockerfile` 是多阶段构建，共三个阶段：
+
+| 阶段           | 作用                                                                                                             |
+| -------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `build`        | `golang:1.25-alpine` 内静态编译（`CGO_ENABLED=0`、`-trimpath -s -w`），产出 `proxy` 与 `demo-backend` 两个二进制 |
+| `proxy`        | 默认目标：alpine + `ca-certificates`／`tzdata`，以非 root 用户运行，内置示例配置与 `HEALTHCHECK`                 |
+| `demo-backend` | 演示后端镜像，供 compose 起多个后端实例                                                                          |
+
+`docker-compose.yml` 用同一份构建上下文起「1 代理 + 2 后端」，代理配置（`deploy/config.docker.yaml`）
+通过卷挂载进容器。`.dockerignore` 排除 `.git`、`.history`、`bin`、本地配置等，
+避免把构建产物送进构建上下文。
+
 ## 三、配置格式
 
 ### 3.1 完整字段表
 
-| 字段 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `listen` | string | `:8080` | 监听地址，不能为空 |
-| `strategy` | string | `round-robin` | `round-robin` / `random` / `weighted-round-robin` |
-| `backends[]` | list | 无（必填 ≥1） | 后端实例列表 |
-| `backends[].url` | string | 无 | 必须是 `http`/`https`，不可重复 |
-| `backends[].weight` | int | `1` | ≤0 时自动归一为 1，仅加权策略使用 |
-| `health_check.enabled` | bool | `true` | 关闭后**主动探测与被动剔除同时失效** |
-| `health_check.path` | string | `/healthz` | 自动补前导 `/`；后端带基础路径时追加在其后 |
-| `health_check.interval` | duration | `5s` | 探测周期，必须 > 0 |
-| `health_check.timeout` | duration | `2s` | 单次探测超时，必须 > 0 |
-| `health_check.failure_threshold` | int | `3` | 连续失败达到该值即剔除，≥1 |
-| `health_check.success_threshold` | int | `2` | 连续成功达到该值即恢复，≥1 |
-| `retry.max_attempts` | int | `3` | 含首次请求的总尝试次数，≥1 |
-| `retry.per_try_timeout` | duration | `3s` | 单次尝试超时，必须 > 0 |
-| `retry.retry_on_status` | list | `[502,503,504]` | 命中即换实例重试，取值 100–599 |
-| `retry.retry_non_idempotent` | bool | `false` | 是否允许非幂等方法完整重试 |
-| `rate_limit.enabled` | bool | `false` | 是否启用令牌桶限流 |
-| `rate_limit.rps` | float | `1000` | 每秒补充的令牌数（平均速率上限），启用时必须 > 0 |
-| `rate_limit.burst` | int | `200` | 桶容量（允许的瞬时突发量），启用时必须 ≥ 1 |
-| `rate_limit.by` | string | `ip` | `ip` 每个客户端一个桶 / `global` 全局共用一个桶 |
-| `logging.level` | string | `info` | `debug` / `info` / `warn` / `error` |
-| `logging.format` | string | `json` | `json` / `text` |
-| `logging.access_log` | bool | `true` | 是否输出访问日志 |
-| `timeouts.read_header` | duration | `10s` | `http.Server` 读请求头超时，> 0 |
-| `timeouts.write` | duration | `0` | 写超时，`0` 表示不限制（支持流式/SSE） |
-| `timeouts.idle` | duration | `90s` | 空闲连接超时，> 0 |
+| 字段                             | 类型     | 默认值          | 说明                                              |
+| -------------------------------- | -------- | --------------- | ------------------------------------------------- |
+| `listen`                         | string   | `:8080`         | 监听地址，不能为空                                |
+| `strategy`                       | string   | `round-robin`   | `round-robin` / `random` / `weighted-round-robin` |
+| `backends[]`                     | list     | 无（必填 ≥1）   | 后端实例列表                                      |
+| `backends[].url`                 | string   | 无              | 必须是 `http`/`https`，不可重复                   |
+| `backends[].weight`              | int      | `1`             | ≤0 时自动归一为 1，仅加权策略使用                 |
+| `health_check.enabled`           | bool     | `true`          | 关闭后**主动探测与被动剔除同时失效**              |
+| `health_check.path`              | string   | `/healthz`      | 自动补前导 `/`；后端带基础路径时追加在其后        |
+| `health_check.interval`          | duration | `5s`            | 探测周期，必须 > 0                                |
+| `health_check.timeout`           | duration | `2s`            | 单次探测超时，必须 > 0                            |
+| `health_check.failure_threshold` | int      | `3`             | 连续失败达到该值即剔除，≥1                        |
+| `health_check.success_threshold` | int      | `2`             | 连续成功达到该值即恢复，≥1                        |
+| `retry.max_attempts`             | int      | `3`             | 含首次请求的总尝试次数，≥1                        |
+| `retry.per_try_timeout`          | duration | `3s`            | 单次尝试超时，必须 > 0                            |
+| `retry.retry_on_status`          | list     | `[502,503,504]` | 命中即换实例重试，取值 100–599                    |
+| `retry.retry_non_idempotent`     | bool     | `false`         | 是否允许非幂等方法完整重试                        |
+| `rate_limit.enabled`             | bool     | `false`         | 是否启用令牌桶限流                                |
+| `rate_limit.rps`                 | float    | `1000`          | 每秒补充的令牌数（平均速率上限），启用时必须 > 0  |
+| `rate_limit.burst`               | int      | `200`           | 桶容量（允许的瞬时突发量），启用时必须 ≥ 1        |
+| `rate_limit.by`                  | string   | `ip`            | `ip` 每个客户端一个桶 / `global` 全局共用一个桶   |
+| `logging.level`                  | string   | `info`          | `debug` / `info` / `warn` / `error`               |
+| `logging.format`                 | string   | `json`          | `json` / `text`                                   |
+| `logging.access_log`             | bool     | `true`          | 是否输出访问日志                                  |
+| `timeouts.read_header`           | duration | `10s`           | `http.Server` 读请求头超时，> 0                   |
+| `timeouts.write`                 | duration | `0`             | 写超时，`0` 表示不限制（支持流式/SSE）            |
+| `timeouts.idle`                  | duration | `90s`           | 空闲连接超时，> 0                                 |
 
 ### 3.2 duration 写法
 
 统一使用 `config.Duration` 自定义类型：
 
-| 写法 | 含义 |
-| --- | --- |
+| 写法                                    | 含义                  |
+| --------------------------------------- | --------------------- |
 | `"500ms"` / `"3s"` / `"1m"` / `"1m30s"` | 标准 Go duration 写法 |
-| `"5"` | 纯数字按**秒**解释 |
-| `""` | 视为 `0` |
-| `"3 秒"` | 报错：`无法解析时长` |
+| `"5"`                                   | 纯数字按**秒**解释    |
+| `""`                                    | 视为 `0`              |
+| `"3 秒"`                                | 报错：`无法解析时长`  |
 
 ### 3.3 加载流程
 
@@ -249,11 +263,11 @@ sequenceDiagram
 
 重试需要同时满足「还有剩余尝试次数」与「该请求允许重试」：
 
-| 失败类型 | 幂等方法<br/>(GET/HEAD/PUT/DELETE/OPTIONS/TRACE) | 非幂等方法<br/>(POST/PATCH/…) |
-| --- | --- | --- |
-| 连接建立失败（dial 失败） | 重试 | **重试**（请求肯定没被后端处理） |
-| 超时 / 连接中断 | 重试 | 不重试 |
-| 命中 `retry_on_status` | 重试 | 不重试 |
+| 失败类型                  | 幂等方法<br/>(GET/HEAD/PUT/DELETE/OPTIONS/TRACE) | 非幂等方法<br/>(POST/PATCH/…)    |
+| ------------------------- | ------------------------------------------------ | -------------------------------- |
+| 连接建立失败（dial 失败） | 重试                                             | **重试**（请求肯定没被后端处理） |
+| 超时 / 连接中断           | 重试                                             | 不重试                           |
+| 命中 `retry_on_status`    | 重试                                             | 不重试                           |
 
 补充规则：
 
@@ -266,11 +280,11 @@ sequenceDiagram
 
 ### 5.1 策略对比
 
-| 策略 | 适用场景 | 实现要点 |
-| --- | --- | --- |
-| `round-robin` | 实例规格一致 | 原子计数器取模 + 定位第 n 个可用实例 |
-| `random` | 实例数多、想避免同步效应 | 随机下标 + 定位第 n 个可用实例 |
-| `weighted-round-robin` | 实例规格不一致 | nginx 同款**平滑**加权轮询 |
+| 策略                   | 适用场景                 | 实现要点                             |
+| ---------------------- | ------------------------ | ------------------------------------ |
+| `round-robin`          | 实例规格一致             | 原子计数器取模 + 定位第 n 个可用实例 |
+| `random`               | 实例数多、想避免同步效应 | 随机下标 + 定位第 n 个可用实例       |
+| `weighted-round-robin` | 实例规格不一致           | nginx 同款**平滑**加权轮询           |
 
 ### 5.2 零分配且公平的取值方式
 
@@ -288,11 +302,11 @@ sequenceDiagram
 权重 3:1 的状态推演：
 
 | 轮次 | 累加后 current | 选中 | 减去总权重后 | 结果 |
-| --- | --- | --- | --- | --- |
-| 1 | [3, 1] | A | [-1, 1] | A |
-| 2 | [2, 2] | A | [-2, 2] | A |
-| 3 | [1, 3] | B | [1, -1] | B |
-| 4 | [4, 0] | A | [0, 0] | A |
+| ---- | -------------- | ---- | ------------ | ---- |
+| 1    | [3, 1]         | A    | [-1, 1]      | A    |
+| 2    | [2, 2]         | A    | [-2, 2]      | A    |
+| 3    | [1, 3]         | B    | [1, -1]      | B    |
+| 4    | [4, 0]         | A    | [0, 0]       | A    |
 
 序列为 `A A B A` 循环（每 4 次 3:1），而不是 `A A A B`。
 
@@ -313,10 +327,10 @@ flowchart LR
 
 ### 6.1 两条通道
 
-| 通道 | 触发方式 | 判定 |
-| --- | --- | --- |
-| **主动** | 每 `interval` 请求一次 `{backend}{health_path}` | **仅 2xx 视为健康**；不跟随重定向（关心该路径本身的响应码）；超时按失败计 |
-| **被动** | 转发出现**传输层错误**时由 `proxy` 上报 `ReportFailure` | 立即计入连续失败，无需等下一个探测周期（更灵敏） |
+| 通道     | 触发方式                                                | 判定                                                                      |
+| -------- | ------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **主动** | 每 `interval` 请求一次 `{backend}{health_path}`         | **仅 2xx 视为健康**；不跟随重定向（关心该路径本身的响应码）；超时按失败计 |
+| **被动** | 转发出现**传输层错误**时由 `proxy` 上报 `ReportFailure` | 立即计入连续失败，无需等下一个探测周期（更灵敏）                          |
 
 两者共用同一套「连续失败 / 连续成功」计数，因此探测成功会**清零**被动累计的失败次数。响应状态码异常（如 503）不计入被动失败——那说明实例是可达的，交给主动探测判定该路径的健康度。
 
@@ -348,31 +362,31 @@ stateDiagram-v2
 
 ## 七、错误码与响应约定
 
-| 场景 | 状态码 | 响应体 |
-| --- | --- | --- |
-| 无任何存活实例 | `503` | `{"error":"no healthy backend","total_backends":N}` |
-| 触发限流 | `429` | `{"error":"too many requests","scope":"ip","retry_after":1}` + `Retry-After` 头 |
-| 单次尝试超时 | `504` | `{"error":"gateway timeout","upstream":"..."}` |
-| 连接失败等其余转发错误 | `502` | `{"error":"bad gateway","upstream":"..."}` |
-| 各种尝试均失败且是状态码触发 | `502` | `{"error":"bad gateway","upstream":"...","last_status":503}` |
-| 后端正常响应（含 4xx/5xx） | 原样透传 | 后端响应体 |
-| 客户端断开 | 不回写 | - |
+| 场景                         | 状态码   | 响应体                                                                          |
+| ---------------------------- | -------- | ------------------------------------------------------------------------------- |
+| 无任何存活实例               | `503`    | `{"error":"no healthy backend","total_backends":N}`                             |
+| 触发限流                     | `429`    | `{"error":"too many requests","scope":"ip","retry_after":1}` + `Retry-After` 头 |
+| 单次尝试超时                 | `504`    | `{"error":"gateway timeout","upstream":"..."}`                                  |
+| 连接失败等其余转发错误       | `502`    | `{"error":"bad gateway","upstream":"..."}`                                      |
+| 各种尝试均失败且是状态码触发 | `502`    | `{"error":"bad gateway","upstream":"...","last_status":503}`                    |
+| 后端正常响应（含 4xx/5xx）   | 原样透传 | 后端响应体                                                                      |
+| 客户端断开                   | 不回写   | -                                                                               |
 
 错误响应统一为 JSON（`application/json; charset=utf-8`），便于客户端与压测脚本解析。
 
 ## 八、并发与资源管理
 
-| 关注点 | 做法 |
-| --- | --- |
-| 实例存活状态 | `atomic.Bool`，读无锁 |
-| 实例统计计数 | `atomic.Int64`（请求数、失败数） |
-| 轮询计数 | `atomic.Uint64` |
-| 平滑加权轮询的 `current` | 互斥锁（需要多字段一致性，且临界区极短） |
-| 健康检查的连续计数 | 互斥锁保护 `map[*Backend]*streak`；日志也在锁内打印，换取实现简单 |
-| 实例集合 | 构造后不再变化，因此无需锁；`All()` 返回快照副本防止外部改写 |
-| 健康检查并发探测 | 每轮对每个实例起 goroutine + `WaitGroup`，一轮内并行 |
-| 连接池 | `MaxIdleConns=256`、`MaxIdleConnsPerHost=64`、`IdleConnTimeout=90s`、`DialTimeout=5s`、`TLSHandshakeTimeout=5s` |
-| 优雅退出 | `signal.NotifyContext` 捕获 SIGINT/SIGTERM → 取消健康检查 → `srv.Shutdown`（最长 10s） |
+| 关注点                   | 做法                                                                                                            |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| 实例存活状态             | `atomic.Bool`，读无锁                                                                                           |
+| 实例统计计数             | `atomic.Int64`（请求数、失败数）                                                                                |
+| 轮询计数                 | `atomic.Uint64`                                                                                                 |
+| 平滑加权轮询的 `current` | 互斥锁（需要多字段一致性，且临界区极短）                                                                        |
+| 健康检查的连续计数       | 互斥锁保护 `map[*Backend]*streak`；日志也在锁内打印，换取实现简单                                               |
+| 实例集合                 | 构造后不再变化，因此无需锁；`All()` 返回快照副本防止外部改写                                                    |
+| 健康检查并发探测         | 每轮对每个实例起 goroutine + `WaitGroup`，一轮内并行                                                            |
+| 连接池                   | `MaxIdleConns=256`、`MaxIdleConnsPerHost=64`、`IdleConnTimeout=90s`、`DialTimeout=5s`、`TLSHandshakeTimeout=5s` |
+| 优雅退出                 | `signal.NotifyContext` 捕获 SIGINT/SIGTERM → 取消健康检查 → `srv.Shutdown`（最长 10s）                          |
 
 所有测试都在 `-race` 下运行，其中包含专门构造的并发场景（并发选路 + 并发切换存活状态、并发探测 + 并发上报）。
 
@@ -392,10 +406,10 @@ Gin 只承担路由与中间件（`Any("/*path")` + `NoRoute` 兜底），转发
 
 候选方案对比：
 
-| 方案 | 结论 |
-| --- | --- |
-| 缓冲整个响应体，判定后再决定 | ❌ 大响应/SSE 会被内存吃满，流式特性丢失 |
-| 用 `lazyWriter` 在 `WriteHeader` 处拦截 | ⚠️ 可行，但需要自造 writer 并处理 header 隔离 |
+| 方案                                             | 结论                                                                                                 |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| 缓冲整个响应体，判定后再决定                     | ❌ 大响应/SSE 会被内存吃满，流式特性丢失                                                             |
+| 用 `lazyWriter` 在 `WriteHeader` 处拦截          | ⚠️ 可行，但需要自造 writer 并处理 header 隔离                                                        |
 | **在 `ModifyResponse` 返回哨兵错误**（最终采用） | ✅ 天然处于「已拿到响应、尚未写回」的位置，失败响应本就会被 `ReverseProxy` 关闭丢弃，无需自造 writer |
 
 再配合 `Balancer.Next(exclude...)` 排除已尝试实例，"客户端只会收到一次响应" 这条不变量就有了保证。
@@ -408,25 +422,25 @@ Gin 只承担路由与中间件（`Any("/*path")` + `NoRoute` 兜底），转发
 
 题面要求是「CLI **或** 配置文件」。若把 YAML 字段全部做成 flag，会造成：配置两个来源（需定义优先级）、校验逻辑写两遍、文档与测试面翻倍。因此 CLI 只保留配置文件表达不了的能力：
 
-| 参数 | 不可替代性 |
-| --- | --- |
-| `-config` | 配置文件本身得先被定位（多环境） |
-| `-check` | 是**动作**而非设置项（CI / 上线前自检） |
-| `-version` | 同样是动作（确认线上跑的是哪个构建） |
-| `-listen` | 部署时覆盖（容器里改文件不便） |
+| 参数       | 不可替代性                              |
+| ---------- | --------------------------------------- |
+| `-config`  | 配置文件本身得先被定位（多环境）        |
+| `-check`   | 是**动作**而非设置项（CI / 上线前自检） |
+| `-version` | 同样是动作（确认线上跑的是哪个构建）    |
+| `-listen`  | 部署时覆盖（容器里改文件不便）          |
 
 ## 十、测试策略
 
-| 对象 | 方法 |
-| --- | --- |
-| 配置 | 表驱动覆盖默认值继承、规范化、时长解析、14 类非法配置、文件缺失 |
-| 后端实例 | 权重/URL 归一化、副本语义、存活翻转、统计、并发读写 |
-| 均衡策略 | 确定性序列断言（随机策略注入可替换的下标选择器）、下线/排除后的分布、并发安全、并发状态切换 |
-| 健康检查 | 阈值剔除与恢复、探测路径与状态码判定、超时、主动被动共用计数、禁用时空操作、`Run` 启停 |
+| 对象     | 方法                                                                                            |
+| -------- | ----------------------------------------------------------------------------------------------- |
+| 配置     | 表驱动覆盖默认值继承、规范化、时长解析、14 类非法配置、文件缺失                                 |
+| 后端实例 | 权重/URL 归一化、副本语义、存活翻转、统计、并发读写                                             |
+| 均衡策略 | 确定性序列断言（随机策略注入可替换的下标选择器）、下线/排除后的分布、并发安全、并发状态切换     |
+| 健康检查 | 阈值剔除与恢复、探测路径与状态码判定、超时、主动被动共用计数、禁用时空操作、`Run` 启停          |
 | 转发内核 | 请求透传、编码路径、基础路径、转发头、502/503/504、重试与排除、幂等性、请求体重放、超大体不重试 |
-| 访问日志 | 字段完整性、5xx 提升为 WARN、含引号查询串不破坏单行 JSON |
-| 限流 | 突发后拒绝与 `Retry-After`、按 IP 隔离、伪造 XFF 无效、令牌补充、空闲桶回收、桶数上限 |
-| CLI | 参数解析、帮助、版本、配置摘要、三种动作与错误路径 |
+| 访问日志 | 字段完整性、5xx 提升为 WARN、含引号查询串不破坏单行 JSON                                        |
+| 限流     | 突发后拒绝与 `Retry-After`、按 IP 隔离、伪造 XFF 无效、令牌补充、空闲桶回收、桶数上限           |
+| CLI      | 参数解析、帮助、版本、配置摘要、三种动作与错误路径                                              |
 
 运行方式：
 
@@ -437,12 +451,11 @@ go test ./... -cover     # 覆盖率
 
 ## 十一、已知局限与演进方向
 
-| 局限 | 说明 |
-| --- | --- |
-| 后端列表静态 | 仅来自配置文件，不支持运行时增删；`Registry` 已按"构造后不变"设计，扩展时需要补锁 |
-| 健康检查状态不持久 | 进程重启后所有实例回到乐观存活，靠首轮探测纠正 |
-| 无分布式协调 | 多代理实例各自探测，不共享健康状态 |
-| 未提供容器化 | Dockerfile / docker-compose 在后续阶段补充 |
-| 无 TLS 终止 | 上游为 http/https 均可转发，但代理自身只提供 HTTP 监听 |
+| 局限               | 说明                                                                              |
+| ------------------ | --------------------------------------------------------------------------------- |
+| 后端列表静态       | 仅来自配置文件，不支持运行时增删；`Registry` 已按"构造后不变"设计，扩展时需要补锁 |
+| 健康检查状态不持久 | 进程重启后所有实例回到乐观存活，靠首轮探测纠正                                    |
+| 无分布式协调       | 多代理实例各自探测，不共享健康状态                                                |
+| 无 TLS 终止        | 上游为 http/https 均可转发，但代理自身只提供 HTTP 监听                            |
 
 **演进方向**：限流（令牌桶）→ Docker 部署 → 可选的管理接口（暴露实例状态与流量统计）。

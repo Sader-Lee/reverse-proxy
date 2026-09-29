@@ -1,0 +1,42 @@
+# 一键起「代理 + 两个后端」的本地演示环境：
+#   docker compose up --build
+#   curl -s http://127.0.0.1:8080/ping        # 响应体里的 instance 会显示是哪个后端处理的
+#
+# 代理读取 deploy/config.docker.yaml（挂载进容器），
+# 后端用仓库自带的演示服务，可通过 -status / -delay 模拟故障实例。
+
+services:
+  proxy:
+    build:
+      context: .
+      target: proxy
+      args:
+        # 可用 VERSION=v1.0.0 docker compose build 覆盖
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILT_AT: ${BUILT_AT:-unknown}
+    image: reverse-proxy:local
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/config.docker.yaml:/etc/proxy/config.yaml:ro
+    depends_on:
+      - backend-a
+      - backend-b
+    restart: unless-stopped
+
+  backend-a:
+    build:
+      context: .
+      target: demo-backend
+    image: reverse-proxy-demo-backend:local
+    command: ["-addr", ":9001", "-name", "backend-a"]
+    restart: unless-stopped
+
+  backend-b:
+    build:
+      context: .
+      target: demo-backend
+    image: reverse-proxy-demo-backend:local
+    command: ["-addr", ":9001", "-name", "backend-b"]
+    restart: unless-stopped

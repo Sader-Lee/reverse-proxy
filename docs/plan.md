@@ -9,16 +9,16 @@
 
 ## 一、需求映射（题目 8 条硬性要求）
 
-| 题号 | 要求 | 实现落点 |
-| --- | --- | --- |
-| 1 | 监听指定端口，接收客户端请求 | `cmd/proxy/main.go` + `gin.Engine`，`router.Any("/*path")` |
-| 2 | 按配置转发到多个后端实例 | `internal/proxy` + `internal/config` |
-| 3 | ≥2 种负载均衡策略 | `internal/balancer`：轮询 / 随机 / 平滑加权轮询 |
-| 4 | 健康检查，剔除并恢复实例 | `internal/health` + `internal/backend` |
-| 5 | 请求超时、重试、访问日志 | `internal/proxy/retry.go` + `internal/middleware/accesslog.go` |
-| 6 | CLI / 配置文件启动 | `internal/config`（YAML + flag 覆盖 + 校验） |
-| 7 | 单元测试覆盖核心逻辑 | 各包 `*_test.go`，`go test ./... -race -cover` |
-| 8 | 项目设计文档 | `docs/design.md` |
+| 题号 | 要求                         | 实现落点                                                       |
+| ---- | ---------------------------- | -------------------------------------------------------------- |
+| 1    | 监听指定端口，接收客户端请求 | `cmd/proxy/main.go` + `gin.Engine`，`router.Any("/*path")`     |
+| 2    | 按配置转发到多个后端实例     | `internal/proxy` + `internal/config`                           |
+| 3    | ≥2 种负载均衡策略            | `internal/balancer`：轮询 / 随机 / 平滑加权轮询                |
+| 4    | 健康检查，剔除并恢复实例     | `internal/health` + `internal/backend`                         |
+| 5    | 请求超时、重试、访问日志     | `internal/proxy/retry.go` + `internal/middleware/accesslog.go` |
+| 6    | CLI / 配置文件启动           | `internal/config`（YAML + flag 覆盖 + 校验）                   |
+| 7    | 单元测试覆盖核心逻辑         | 各包 `*_test.go`，`go test ./... -race -cover`                 |
+| 8    | 项目设计文档                 | `docs/design.md`                                               |
 
 ## 二、可选模块范围（已确认）
 
@@ -92,17 +92,17 @@ reverse-proxy/
 
 ## 六、阶段计划
 
-| # | 阶段 | 分支 | 交付物 | 验收证据 |
-| --- | --- | --- | --- | --- |
-| 0 | 骨架 | `chore/scaffold` | `go mod init`、目录、`.gitignore`、`Makefile`、UTF-8 README | `go build ./...` 通过 |
-| 1 | MVP 转发 | `feat/mvp-proxy` | 单后端 `ReverseProxy` 透传 + 访问日志 | 起后端 + 代理，`curl` 拿到后端内容，日志打印状态码与耗时 |
-| 2 | 负载均衡 | `feat/balancer` | `Balancer` 接口 + 轮询/随机/平滑加权 + 单测 | `go test ./internal/balancer/ -race`；3 个 httptest 后端验证分布比例 |
-| 3 | 健康检查 | `feat/health-check` | 主动探测 + 剔除 + 恢复 + 单测 | 杀掉后端 -> 日志 `mark DOWN` -> 流量全走存活节点；重启 -> `mark UP` |
-| 4 | 超时与重试 | `feat/retry-timeout` | 每尝试超时、重试策略、lazyWriter + 单测 | 慢后端验证超时；flaky 后端验证重试成功且客户端只收一个响应 |
-| 5 | 配置与 CLI | `feat/config-cli` | YAML 全字段 + flag 覆盖 + 校验 + 示例配置 | 改 YAML 切策略/端口，无需重编译即生效 |
-| 6 | 测试补全 | `test/coverage` | e2e 测试、边界用例 | `go test ./... -race -cover`，core 包覆盖率 ≥70% |
-| 7 | 设计文档 | `docs/design` | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制 | 按文档从零启动一次成功 |
-| 8 | 可选模块 | `feat/ratelimit`、`feat/docker` | 令牌桶限流、Dockerfile + compose | 压测触发 429；`docker compose up` 可用 |
+| #   | 阶段       | 分支                            | 交付物                                                         | 验收证据                                                             |
+| --- | ---------- | ------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 0   | 骨架       | `chore/scaffold`                | `go mod init`、目录、`.gitignore`、`Makefile`、UTF-8 README    | `go build ./...` 通过                                                |
+| 1   | MVP 转发   | `feat/mvp-proxy`                | 单后端 `ReverseProxy` 透传 + 访问日志                          | 起后端 + 代理，`curl` 拿到后端内容，日志打印状态码与耗时             |
+| 2   | 负载均衡   | `feat/balancer`                 | `Balancer` 接口 + 轮询/随机/平滑加权 + 单测                    | `go test ./internal/balancer/ -race`；3 个 httptest 后端验证分布比例 |
+| 3   | 健康检查   | `feat/health-check`             | 主动探测 + 剔除 + 恢复 + 单测                                  | 杀掉后端 -> 日志 `mark DOWN` -> 流量全走存活节点；重启 -> `mark UP`  |
+| 4   | 超时与重试 | `feat/retry-timeout`            | 每尝试超时、重试策略、lazyWriter + 单测                        | 慢后端验证超时；flaky 后端验证重试成功且客户端只收一个响应           |
+| 5   | 配置与 CLI | `feat/config-cli`               | YAML 全字段 + flag 覆盖 + 校验 + 示例配置                      | 改 YAML 切策略/端口，无需重编译即生效                                |
+| 6   | 测试补全   | `test/coverage`                 | e2e 测试、边界用例                                             | `go test ./... -race -cover`，core 包覆盖率 ≥70%                     |
+| 7   | 设计文档   | `docs/design`                   | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制 | 按文档从零启动一次成功                                               |
+| 8   | 可选模块   | `feat/ratelimit`、`feat/docker` | 令牌桶限流、Dockerfile + compose                               | 压测触发 429；`docker compose up` 可用                               |
 
 ### 每阶段固定收尾动作
 
@@ -116,7 +116,7 @@ reverse-proxy/
 ```yaml
 listen: ":8080"
 
-strategy: "weighted-round-robin"   # round-robin | random | weighted-round-robin
+strategy: "weighted-round-robin" # round-robin | random | weighted-round-robin
 
 backends:
   - url: "http://127.0.0.1:9001"
@@ -129,11 +129,11 @@ health_check:
   path: "/healthz"
   interval: "5s"
   timeout: "2s"
-  failure_threshold: 3      # 连续失败 N 次标记 DOWN
-  success_threshold: 2      # 连续成功 M 次标记 UP
+  failure_threshold: 3 # 连续失败 N 次标记 DOWN
+  success_threshold: 2 # 连续成功 M 次标记 UP
 
 retry:
-  max_attempts: 3           # 含首次请求
+  max_attempts: 3 # 含首次请求
   per_try_timeout: "3s"
   retry_on_status: [502, 503, 504]
   retry_non_idempotent: false
@@ -142,11 +142,11 @@ rate_limit:
   enabled: false
   rps: 1000
   burst: 200
-  by: "ip"                  # ip | global
+  by: "ip" # ip | global
 
 logging:
-  level: "info"             # debug | info | warn | error
-  format: "json"            # json | text
+  level: "info" # debug | info | warn | error
+  format: "json" # json | text
   access_log: true
 
 admin:
@@ -155,26 +155,26 @@ admin:
 
 timeouts:
   read_header: "10s"
-  write: "0s"               # 0 = 不限制（支持流式/SSE）
+  write: "0s" # 0 = 不限制（支持流式/SSE）
   idle: "90s"
 ```
 
 ## 八、测试策略
 
-| 测试对象 | 方法 |
-| --- | --- |
-| Balancer 策略 | 表驱动；随机策略注入固定 seed 的 `*rand.Rand` 保证可复现 |
-| Registry 并发 | `-race` 下 N 个 goroutine 并发 `Next()` + 增删实例 |
-| 健康检查 | 抽象 `Ticker`/时钟接口，用假时钟快进，避免真实 sleep |
-| 超时 | `httptest` 后端 `time.Sleep` 超过阈值，断言 504 |
-| 重试 | 前 N-1 次返回 503 / 直接 `panic` 断连，断言最终成功且请求计数正确 |
-| 端到端 | `test/e2e_test.go` 起 3 个真实后端 + 真实代理，断言分发与剔除行为 |
+| 测试对象      | 方法                                                              |
+| ------------- | ----------------------------------------------------------------- |
+| Balancer 策略 | 表驱动；随机策略注入固定 seed 的 `*rand.Rand` 保证可复现          |
+| Registry 并发 | `-race` 下 N 个 goroutine 并发 `Next()` + 增删实例                |
+| 健康检查      | 抽象 `Ticker`/时钟接口，用假时钟快进，避免真实 sleep              |
+| 超时          | `httptest` 后端 `time.Sleep` 超过阈值，断言 504                   |
+| 重试          | 前 N-1 次返回 503 / 直接 `panic` 断连，断言最终成功且请求计数正确 |
+| 端到端        | `test/e2e_test.go` 起 3 个真实后端 + 真实代理，断言分发与剔除行为 |
 
 ## 九、风险与对策
 
-| 风险 | 对策 |
-| --- | --- |
-| Gin 与 `ReverseProxy` 组合时 URL 被二次解码 | 阶段 1 就用带 `%2F` 的路径做回归测试 |
-| 重试导致非幂等请求重复提交 | 默认不重试非幂等方法的 5xx；`lazyWriter` 保证"响应未提交才能重试" |
-| 流式响应（SSE）被超时掐断 | 每尝试超时用 context 控制，写超时默认 0；客户端断开即 cancel |
-| 并发写 `Backend` 状态竞态 | 状态用 `atomic`，Registry 用 `RWMutex`，全部测试跑 `-race` |
+| 风险                                        | 对策                                                              |
+| ------------------------------------------- | ----------------------------------------------------------------- |
+| Gin 与 `ReverseProxy` 组合时 URL 被二次解码 | 阶段 1 就用带 `%2F` 的路径做回归测试                              |
+| 重试导致非幂等请求重复提交                  | 默认不重试非幂等方法的 5xx；`lazyWriter` 保证"响应未提交才能重试" |
+| 流式响应（SSE）被超时掐断                   | 每尝试超时用 context 控制，写超时默认 0；客户端断开即 cancel      |
+| 并发写 `Backend` 状态竞态                   | 状态用 `atomic`，Registry 用 `RWMutex`，全部测试跑 `-race`        |

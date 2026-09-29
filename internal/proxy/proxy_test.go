@@ -601,6 +601,28 @@ func TestRetriesNonIdempotentWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestRetryStopsWhenAllBackendsExcluded(t *testing.T) {
+	instances := []*backend.Backend{
+		testBackend(t, deadAddress(t), 1),
+		testBackend(t, deadAddress(t), 1),
+	}
+	// max_attempts 大于实例数量：应在用完所有实例后停止并回写错误，
+	// 而不是反复尝试同一个坏实例
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 5}, instances...)
+	router := newTestRouter(t, handler)
+
+	w := serve(router, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d, 期望 502", w.Code)
+	}
+	for _, b := range instances {
+		if stats := b.Stats(); stats.Requests != 1 {
+			t.Errorf("实例 %s 被尝试 %d 次, 期望 1（不应重复尝试同一实例）", b.String(), stats.Requests)
+		}
+	}
+}
+
 func TestRetryReplaysRequestBody(t *testing.T) {
 	var (
 		mu       sync.Mutex
@@ -736,6 +758,56 @@ func TestLargeBodyIsStreamedIntact(t *testing.T) {
 	}
 }
 
+func TestDoesNotRetryNonIdempotentOnTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+	}))
+	t.Cleanup(slow.Close)
+
+	slowInstance := testBackend(t, slow.URL, 1)
+	fastInstance := testBackend(t, namedUpstream(t, "backend-b", http.StatusOK).URL, 1)
+
+	handler := newTestHandlerWith(t, nil, Options{
+		MaxAttempts:   3,
+		PerTryTimeout: 30 * time.Millisecond,
+	}, slowInstance, fastInstance)
+	router := newTestRouter(t, handler)
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/order", strings.NewReader(`{"id":1}`))
+	w := serve(router, req)
+
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("状态码 = %d, 期望 504", w.Code)
+	}
+	if stats := slowInstance.Stats(); stats.Requests != 1 {
+		t.Errorf("超时实例被尝试 %d 次, 期望 1（非幂等方法超时不应重试）", stats.Requests)
+	}
+	if stats := fastInstance.Stats(); stats.Requests != 0 {
+		t.Errorf("健康实例被请求 %d 次, 期望 0（不应换实例重试）", stats.Requests)
+	}
+}
+
+func TestLargeBodyIsNotRetried(t *testing.T) {
+	fastInstance := testBackend(t, namedUpstream(t, "backend-b", http.StatusOK).URL, 1)
+
+	handler := newTestHandlerWith(t, nil, Options{MaxAttempts: 3},
+		testBackend(t, deadAddress(t), 1), fastInstance)
+	router := newTestRouter(t, handler)
+
+	// 超过 maxReplayBodyBytes 的请求体无法缓冲重放，
+	// 因此即使还有健康实例也不会重试
+	large := strings.Repeat("x", maxReplayBodyBytes+1024)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/upload", strings.NewReader(large))
+	w := serve(router, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("状态码 = %d, 期望 502", w.Code)
+	}
+	if stats := fastInstance.Stats(); stats.Requests != 0 {
+		t.Errorf("健康实例被请求 %d 次, 期望 0（请求体不可重放时不重试）", stats.Requests)
+	}
+}
+
 func TestReadReplayBody(t *testing.T) {
 	t.Run("无请求体", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil)
@@ -762,7 +834,7 @@ func TestReadReplayBody(t *testing.T) {
 			t.Errorf("超限时应返回 (nil, false)，实际 (%v, %v)", body, replayable)
 		}
 
-		// r.Body 已被拼回完整流，转发仍能读到全部内容
+		// r.Body 已被拼回完整流，转发仍能读到全部内容，关闭时也不应报错
 		rest, err := io.ReadAll(req.Body)
 		if err != nil {
 			t.Fatalf("读取拼回的请求体失败: %v", err)
@@ -770,21 +842,15 @@ func TestReadReplayBody(t *testing.T) {
 		if string(rest) != payload {
 			t.Errorf("拼回的请求体长度 = %d, 期望 %d", len(rest), len(payload))
 		}
+		if err := req.Body.Close(); err != nil {
+			t.Errorf("关闭拼回的请求体失败: %v", err)
+		}
 	})
 }
 
 func TestIsIdempotent(t *testing.T) {
-	idempotent := []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodTrace}
-	nonIdempotent := []string{http.MethodPost, http.MethodPatch, "CUSTOM"}
-
-	for _, method := range idempotent {
-		if !isIdempotent(method) {
-			t.Errorf("%s 应被视为幂等", method)
-		}
-	}
-	for _, method := range nonIdempotent {
-		if isIdempotent(method) {
-			t.Errorf("%s 不应被视为幂等", method)
-		}
+	// 详细的方法级校验见 retry_test.go 中的策略单测
+	if !isIdempotent(http.MethodGet) || isIdempotent(http.MethodPost) {
+		t.Error("幂等性判定异常")
 	}
 }

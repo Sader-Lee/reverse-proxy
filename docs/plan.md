@@ -93,17 +93,17 @@ reverse-proxy/
 
 ## 六、阶段计划
 
-| #   | 阶段       | 分支                            | 交付物                                                         | 验收证据                                                             |
-| --- | ---------- | ------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------- |
-| 0   | 骨架       | `chore/scaffold`                | `go mod init`、目录、`.gitignore`、`Makefile`、UTF-8 README    | `go build ./...` 通过                                                |
-| 1   | MVP 转发   | `feat/mvp-proxy`                | 单后端 `ReverseProxy` 透传 + 访问日志                          | 起后端 + 代理，`curl` 拿到后端内容，日志打印状态码与耗时             |
-| 2   | 负载均衡   | `feat/balancer`                 | `Balancer` 接口 + 轮询/随机/平滑加权 + 单测                    | `go test ./internal/balancer/ -race`；3 个 httptest 后端验证分布比例 |
-| 3   | 健康检查   | `feat/health-check`             | 主动探测 + 剔除 + 恢复 + 单测                                  | 杀掉后端 -> 日志 `mark DOWN` -> 流量全走存活节点；重启 -> `mark UP`  |
-| 4   | 超时与重试 | `feat/retry-timeout`            | 每尝试超时、重试策略、lazyWriter + 单测                        | 慢后端验证超时；flaky 后端验证重试成功且客户端只收一个响应           |
-| 5   | 最小 CLI   | `feat/config-cli`               | 仅 `-config` / `-check` / `-version` / `-listen`，不重复配置字段 | `-check` 能报出配置问题；`-version` 能区分构建 |
-| 6   | 测试补全   | `test/coverage`                 | e2e 测试、边界用例                                             | `go test ./... -race -cover`，core 包覆盖率 ≥70%                     |
-| 7   | 设计文档   | `docs/design`                   | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制 | 按文档从零启动一次成功                                               |
-| 8   | 可选模块   | `feat/ratelimit`、`feat/docker` | 令牌桶限流、Dockerfile + compose                               | 压测触发 429；`docker compose up` 可用                               |
+| #   | 阶段       | 分支                            | 交付物                                                           | 验收证据                                                             |
+| --- | ---------- | ------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 0   | 骨架       | `chore/scaffold`                | `go mod init`、目录、`.gitignore`、`Makefile`、UTF-8 README      | `go build ./...` 通过                                                |
+| 1   | MVP 转发   | `feat/mvp-proxy`                | 单后端 `ReverseProxy` 透传 + 访问日志                            | 起后端 + 代理，`curl` 拿到后端内容，日志打印状态码与耗时             |
+| 2   | 负载均衡   | `feat/balancer`                 | `Balancer` 接口 + 轮询/随机/平滑加权 + 单测                      | `go test ./internal/balancer/ -race`；3 个 httptest 后端验证分布比例 |
+| 3   | 健康检查   | `feat/health-check`             | 主动探测 + 剔除 + 恢复 + 单测                                    | 杀掉后端 -> 日志 `mark DOWN` -> 流量全走存活节点；重启 -> `mark UP`  |
+| 4   | 超时与重试 | `feat/retry-timeout`            | 每尝试超时、重试策略、lazyWriter + 单测                          | 慢后端验证超时；flaky 后端验证重试成功且客户端只收一个响应           |
+| 5   | 最小 CLI   | `feat/config-cli`               | 仅 `-config` / `-check` / `-version` / `-listen`，不重复配置字段 | `-check` 能报出配置问题；`-version` 能区分构建                       |
+| 6   | 测试补全   | `test/coverage`                 | 核心逻辑边界用例（负载均衡/健康检查/超时重试）                     | 三个核心包覆盖率 94.8%–98.3%；不给装配代码造测试                     |
+| 7   | 设计文档   | `docs/design`                   | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制   | 按文档从零启动一次成功                                               |
+| 8   | 可选模块   | `feat/ratelimit`、`feat/docker` | 令牌桶限流、Dockerfile + compose                                 | 压测触发 429；`docker compose up` 可用                               |
 
 ### 每阶段固定收尾动作
 

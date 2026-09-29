@@ -238,7 +238,9 @@ func (h *Handler) classifyAttemptError(req *http.Request, err error) {
 	}
 
 	st.transportErr = err
-	if st.canRetryTransport(err) {
+	// 只有还有剩余尝试次数时才标记重试；否则直接走"回写错误"分支，
+	// 这样日志不会在最后一次尝试时误报"换实例重试"。
+	if st.attempt < st.maxAttempts && st.canRetryTransport(err) {
 		st.retried = true
 	}
 }

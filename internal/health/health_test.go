@@ -312,6 +312,92 @@ func TestRunProbesAndStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+func TestRunReturnsImmediatelyWhenDisabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.Enabled = false
+	checker, _ := newChecker(t, cfg, "http://127.0.0.1:9001")
+
+	done := make(chan struct{})
+	go func() {
+		checker.Run(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("健康检查关闭时 Run 应立即返回")
+	}
+}
+
+func TestRunSkipsNonPositiveInterval(t *testing.T) {
+	cfg := testConfig()
+	cfg.Interval = 0
+	checker, registry := newChecker(t, cfg, "http://127.0.0.1:9001")
+
+	done := make(chan struct{})
+	go func() {
+		checker.Run(context.Background())
+		close(done)
+	}()
+
+	select {
+	case <-done: // time.NewTicker(0) 会 panic，此处保证非法周期已被拦下
+	case <-time.After(2 * time.Second):
+		t.Fatal("周期非法时 Run 应立即返回")
+	}
+
+	if !registry.All()[0].Alive() {
+		t.Error("周期非法时不应改动实例状态")
+	}
+}
+
+func TestProbeDoesNotFollowRedirect(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path == "/healthz" {
+			// 带 Location 的 301：若客户端跟随重定向就会打到 /healthy 并拿到 200
+			http.Redirect(w, r, "/healthy", http.StatusMovedPermanently)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := testConfig()
+	cfg.FailureThreshold = 1
+	checker, registry := newChecker(t, cfg, srv.URL)
+	instance := registry.All()[0]
+
+	checker.CheckOnce(context.Background())
+
+	if got := hits.Load(); got != 1 {
+		t.Errorf("探测请求数 = %d, 期望 1（不应跟随重定向）", got)
+	}
+	if instance.Alive() {
+		t.Error("301 不应视为健康")
+	}
+}
+
+func TestNewToleratesNilDependencies(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("New 不应 panic: %v", r)
+		}
+	}()
+
+	cfg := testConfig()
+	cfg.Enabled = false
+
+	checker := New(nil, cfg, nil) // registry 与 logger 均允许为 nil
+	if checker.Enabled() {
+		t.Error("Enabled 应为 false")
+	}
+	checker.CheckOnce(context.Background())
+	checker.ReportFailure(nil)
+}
+
 func TestCheckerIsConcurrencySafe(t *testing.T) {
 	var healthy atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

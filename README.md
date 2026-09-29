@@ -19,10 +19,9 @@
 | 4   | 后端健康检查，自动剔除与恢复             | ✅ 阶段 3   |
 | 5   | 请求超时、失败重试、访问日志             | ✅ 阶段 1/4 |
 | 6   | CLI + YAML 配置文件启动                  | ✅ 阶段 0   |
-| 7   | 单元测试覆盖核心逻辑                     | 🚧 阶段 6   |
+| 7   | 单元测试覆盖核心逻辑                     | ✅ 阶段 6   |
 | 8   | 项目设计文档                             | ✅ 阶段 7   |
 | 9   | 令牌桶限流（可选）                       | ✅ 阶段 8   |
-| 10  | Docker / docker-compose 部署（可选）     | ✅ 阶段 8   |
 
 ## 快速开始
 
@@ -187,29 +186,6 @@ timeouts:
 - 每 IP 的桶会按空闲时长回收（10 分钟），且总数有上限（10000），避免大量来源 IP 撑爆内存；
 - 配置非法（`rps <= 0` 或 `burst < 1`）时跳过限流并打警告，而不是把请求全部拒绝。
 
-## Docker 部署
-
-> **验证状态（如实说明）**：本机 Docker Hub（经 daocloud 加速）拉取 `golang:1.25-alpine`
-> 的新版本层只有约 0.05 MB/s，60 MB 的基础镜像层需要 20 分钟以上，因此这一节**未完成
-> 镜像构建与 `docker compose up` 的实跑验证**。已完成的验证：`docker compose config`
-> 语法校验通过；容器内配置经 `proxy -check` 校验通过；`Dockerfile` 中的构建命令（交叉编译
-> 参数、`-ldflags` 注入）已在宿主机上等价执行通过。
-
-```bash
-docker compose up --build      # 起 1 个代理 + 2 个后端
-docker compose down            # 停止并清理
-```
-
-- 代理监听 `8080`，按 `deploy/config.docker.yaml` 做加权轮询（backend-a : backend-b = 3 : 1）；
-  `curl http://127.0.0.1:8080/ping` 的响应体里 `instance` 字段会显示是哪一路后端处理的；
-- `Dockerfile` 为**多阶段构建**：`build` 阶段用 `golang:1.25-alpine` 静态编译（`CGO_ENABLED=0`，
-  `-trimpath -s -w`），产物分别复制到 `proxy` 与 `demo-backend` 两个精简运行阶段，
-  两者都以非 root 用户运行；
-- `.dockerignore` 排除了 `.git` / `.history` / `bin` / 本地配置等，避免把几十 MB 的旧构建产物
-  送进构建上下文（`bin` 在本地可达 43 MB）；
-- 容器内配置由 compose 挂载 `deploy/config.docker.yaml` 到 `/etc/proxy/config.yaml`，
-  后端地址用 compose 服务名解析；镜像自带 `HEALTHCHECK`（执行 `proxy -check` 验证进程与配置）。
-
 ## 目录结构
 
 ```
@@ -222,12 +198,9 @@ docker compose down            # 停止并清理
 │   ├── health/           # 健康检查：主动探测 + 转发失败被动上报
 │   ├── proxy/            # 转发、实例选择、超时与重试
 │   └── middleware/       # 访问日志、令牌桶限流
-├── hack/demo-backend/    # 本地验证与容器演示用的后端
+├── hack/demo-backend/    # 本地验证用的演示后端
 ├── configs/              # 配置示例（config.example.yaml）
-├── deploy/               # 容器内使用的配置
-├── docs/                 # 实施计划与设计文档
-├── Dockerfile            # 多阶段构建：build → proxy / demo-backend
-└── docker-compose.yml    # 一键起「代理 + 两个后端」
+└── docs/                 # 实施计划与设计文档
 ```
 
 ## 开发
@@ -263,5 +236,4 @@ go test ./... -cover    # 覆盖率
 - [x] **阶段 5** 最小 CLI（`-config` / `-check` / `-version` / `-listen`，退出码约定，版本信息注入）
 - [x] **阶段 6** 单元测试补全（核心逻辑覆盖率：负载均衡 98.3% / 健康检查 95.8% / 超时重试 94.8%）
 - [x] **阶段 7** 设计文档（[`docs/design.md`](docs/design.md)：架构、配置格式、转发流程、健康检查机制）
-- [x] **阶段 8a** 令牌桶限流（按 IP / 全局，超限 429 并返回 `Retry-After`）
-- [x] **阶段 8b** Docker 部署（多阶段构建 + `.dockerignore` + compose；因本机拉取基础镜像过慢，未做实跑验证）
+- [x] **阶段 8** 令牌桶限流（按 IP / 全局，超限 429 并返回 `Retry-After`）

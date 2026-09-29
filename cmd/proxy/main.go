@@ -118,7 +118,7 @@ func run(opts options) error {
 	}
 
 	srv := &http.Server{
-		Handler:           newRouter(handler, logger),
+		Handler:           newRouter(ctx, cfg, handler, logger),
 		ReadHeaderTimeout: cfg.Timeouts.ReadHeader.Duration(),
 		WriteTimeout:      cfg.Timeouts.Write.Duration(),
 		IdleTimeout:       cfg.Timeouts.Idle.Duration(),
@@ -133,6 +133,7 @@ func run(opts options) error {
 		"backends", registry.Len(),
 		"healthy", registry.HealthyLen(),
 		"health_check", checker.Enabled(),
+		"rate_limit", cfg.RateLimit.Enabled,
 		"config", opts.configPath,
 	)
 
@@ -159,14 +160,27 @@ func run(opts options) error {
 	return nil
 }
 
-// newRouter 装配 Gin 引擎：把所有路径交给代理处理，并挂上访问日志中间件。
-func newRouter(handler *proxy.Handler, logger *slog.Logger) *gin.Engine {
+// newRouter 装配 Gin 引擎：把所有路径交给代理处理，并挂上访问日志与限流中间件。
+//
+// 中间件顺序即请求经过的顺序：Recovery → AccessLog → RateLimit，
+// 因此被限流拒绝的请求也会被访问日志记录下来。
+func newRouter(ctx context.Context, cfg *config.Config, handler *proxy.Handler, logger *slog.Logger) *gin.Engine {
 	// 关闭 Gin 自带的调试输出（路由表与模式警告），日志统一走 slog
 	gin.SetMode(gin.ReleaseMode)
 
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(middleware.AccessLog(logger))
+
+	if cfg.RateLimit.Enabled {
+		router.Use(middleware.RateLimit(ctx, cfg.RateLimit, logger))
+	}
+
+	// 不信任任何代理头：ClientIP 始终取真实 TCP 来源，
+	// 避免客户端伪造 X-Forwarded-For 换一个新桶来绕过按 IP 限流。
+	if err := router.SetTrustedProxies(nil); err != nil {
+		logger.Warn("关闭受信代理失败", "err", err.Error())
+	}
 
 	// 保留客户端原始 URL 编码（如 %2F），避免 Gin 二次解码后转发到错误路径
 	router.UseRawPath = true

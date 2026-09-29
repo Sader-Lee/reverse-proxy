@@ -101,7 +101,7 @@ reverse-proxy/
 | 3   | 健康检查   | `feat/health-check`             | 主动探测 + 剔除 + 恢复 + 单测                                    | 杀掉后端 -> 日志 `mark DOWN` -> 流量全走存活节点；重启 -> `mark UP`  |
 | 4   | 超时与重试 | `feat/retry-timeout`            | 每尝试超时、重试策略、lazyWriter + 单测                          | 慢后端验证超时；flaky 后端验证重试成功且客户端只收一个响应           |
 | 5   | 最小 CLI   | `feat/config-cli`               | 仅 `-config` / `-check` / `-version` / `-listen`，不重复配置字段 | `-check` 能报出配置问题；`-version` 能区分构建                       |
-| 6   | 测试补全   | `test/coverage`                 | e2e 测试、边界用例                                               | `go test ./... -race -cover`，core 包覆盖率 ≥70%                     |
+| 6   | 测试补全   | `test/coverage`                 | 核心逻辑边界用例（负载均衡/健康检查/超时重试）                     | 三个核心包覆盖率 94.8%–98.3%；不给装配代码造测试                     |
 | 7   | 设计文档   | `docs/design`                   | `docs/design.md`：架构、配置格式、转发流程时序图、健康检查机制   | 按文档从零启动一次成功                                               |
 | 8   | 可选模块   | `feat/ratelimit`、`feat/docker` | 令牌桶限流、Dockerfile + compose                                 | 压测触发 429；`docker compose up` 可用                               |
 

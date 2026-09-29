@@ -6,7 +6,8 @@
 并提供 YAML 配置文件驱动的启动方式。
 
 > 技术栈：Go 1.25+ · Gin · `net/http/httputil.ReverseProxy`
-> 详细设计见 [`docs/design.md`](docs/design.md)，实施计划见 [`docs/plan.md`](docs/plan.md)。
+> 详细设计见 [`docs/design.md`](docs/design.md)（架构、配置格式、转发流程、健康检查机制），
+> 实施计划见 [`docs/plan.md`](docs/plan.md)。
 
 ## 功能特性
 
@@ -19,7 +20,7 @@
 | 5   | 请求超时、失败重试、访问日志             | ✅ 阶段 1/4 |
 | 6   | CLI + YAML 配置文件启动                  | ✅ 阶段 0   |
 | 7   | 单元测试覆盖核心逻辑                     | 🚧 阶段 6   |
-| 8   | 项目设计文档                             | 🚧 阶段 7   |
+| 8   | 项目设计文档                             | ✅ 阶段 7   |
 | 9   | 令牌桶限流（可选）                       | 🚧 阶段 8   |
 | 10  | Docker / docker-compose 部署（可选）     | 🚧 阶段 8   |
 
@@ -204,5 +205,5 @@ go test ./... -cover    # 覆盖率
 - [x] **阶段 4** 超时与重试（单次尝试超时 504、按状态码/连接失败换实例重试、请求体重放）
 - [x] **阶段 5** 最小 CLI（`-config` / `-check` / `-version` / `-listen`，退出码约定，版本信息注入）
 - [ ] **阶段 6** 单元测试补全
-- [ ] **阶段 7** 设计文档
+- [x] **阶段 7** 设计文档（[`docs/design.md`](docs/design.md)：架构、配置格式、转发流程、健康检查机制）
 - [ ] **阶段 8** 限流与 Docker 部署

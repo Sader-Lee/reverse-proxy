@@ -12,11 +12,11 @@
 
 | #   | 特性                                     | 状态      |
 | --- | ---------------------------------------- | --------- |
-| 1   | 监听指定端口，接收客户端 HTTP 请求       | 🚧 阶段 1 |
-| 2   | 按配置将请求转发到多个后端实例           | 🚧 阶段 1 |
+| 1   | 监听指定端口，接收客户端 HTTP 请求       | ✅ 阶段 1 |
+| 2   | 按配置将请求转发到多个后端实例           | 🚧 阶段 2 |
 | 3   | 负载均衡策略：轮询 / 随机 / 平滑加权轮询 | 🚧 阶段 2 |
 | 4   | 后端健康检查，自动剔除与恢复             | 🚧 阶段 3 |
-| 5   | 请求超时、失败重试、访问日志             | 🚧 阶段 4 |
+| 5   | 请求超时、失败重试、访问日志             | 🚧 阶段 1/4 |
 | 6   | CLI + YAML 配置文件启动                  | ✅ 阶段 0 |
 | 7   | 单元测试覆盖核心逻辑                     | 🚧 阶段 6 |
 | 8   | 项目设计文档                             | 🚧 阶段 7 |
@@ -29,10 +29,21 @@
 # 1. 准备配置
 cp configs/config.example.yaml configs/config.yaml
 
-# 2. 编译并启动
-go build -o bin/proxy ./cmd/proxy
-./bin/proxy -config configs/config.yaml
+# 2. 启动一个演示后端（仓库自带，用于本地验证）
+go run ./hack/demo-backend -addr :9001 -name backend-a
+
+# 3. 启动代理
+go run ./cmd/proxy -config configs/config.yaml
+
+# 4. 发起请求：响应体会回显实例名、原始路径与转发头
+curl -i "http://127.0.0.1:8080/api/users?page=2"
 ```
+
+> 阶段 1 只把请求转发到配置里的**第一个**后端；多实例负载均衡在阶段 2 接入。
+>
+> 也可以编译成二进制：`go build -o bin/proxy ./cmd/proxy`。注意 Windows 下产物是 `bin\proxy.exe`
+> （建议显式写成 `-o bin/proxy.exe`），否则 PowerShell 无法直接执行；`make run` 同理可用
+> `make run BINARY=bin/proxy.exe` 覆盖输出名。
 
 也可以用 Makefile：
 
@@ -103,11 +114,12 @@ timeouts:
 ├── cmd/proxy/            # 程序入口
 ├── internal/
 │   ├── config/           # 配置加载、默认值、校验
-│   ├── backend/          # 后端实例注册表与状态（阶段 1+）
+│   ├── backend/          # 后端实例注册表与状态（阶段 2）
 │   ├── balancer/         # 负载均衡策略（阶段 2）
 │   ├── health/           # 健康检查（阶段 3）
 │   ├── proxy/            # 转发、超时、重试（阶段 1、4）
-│   └── middleware/       # 访问日志、限流（阶段 4、8）
+│   └── middleware/       # 访问日志、限流（阶段 1、8）
+├── hack/demo-backend/    # 本地验证用的演示后端
 ├── configs/              # 配置示例
 ├── docs/                 # 计划与设计文档
 └── test/                 # 端到端测试
@@ -125,7 +137,7 @@ go test ./... -cover    # 覆盖率
 ## 开发进度
 
 - [x] **阶段 0** 项目骨架、配置加载与校验
-- [ ] **阶段 1** 最小可用转发（单后端透传 + 访问日志）
+- [x] **阶段 1** 最小可用转发（Gin + ReverseProxy 透传、X-Forwarded-*、访问日志、优雅退出、502 兜底）
 - [ ] **阶段 2** 负载均衡策略
 - [ ] **阶段 3** 健康检查
 - [ ] **阶段 4** 超时与重试

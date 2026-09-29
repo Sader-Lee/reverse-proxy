@@ -11,6 +11,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/Sader-Lee/reverse-proxy/internal/backend"
+	"github.com/Sader-Lee/reverse-proxy/internal/balancer"
 )
 
 // discardLogger 返回一个丢弃全部输出的日志器，避免测试噪音。
@@ -38,6 +41,26 @@ func newRecorder() *closeNotifierRecorder {
 
 func (r *closeNotifierRecorder) CloseNotify() <-chan bool { return r.notify }
 
+// testBackend 构造一个测试用后端实例。
+func testBackend(t *testing.T, rawURL string, weight int) *backend.Backend {
+	t.Helper()
+	b, err := backend.New(rawURL, weight)
+	if err != nil {
+		t.Fatalf("构造后端 %s 失败: %v", rawURL, err)
+	}
+	return b
+}
+
+// newTestHandler 用给定后端构造轮询策略的处理器。
+func newTestHandler(t *testing.T, backends ...*backend.Backend) *Handler {
+	t.Helper()
+	h, err := New(balancer.NewRoundRobin(backends), backend.NewRegistry(backends...), discardLogger())
+	if err != nil {
+		t.Fatalf("构造处理器失败: %v", err)
+	}
+	return h
+}
+
 // newTestRouter 按与 main 一致的路由配置装配引擎：
 // 开启 UseRawPath 并关闭路径反转义，确保测试覆盖真实的 URL 编码行为。
 func newTestRouter(t *testing.T, handler *Handler) *gin.Engine {
@@ -52,28 +75,14 @@ func newTestRouter(t *testing.T, handler *Handler) *gin.Engine {
 	return router
 }
 
-func TestNewRejectsInvalidTarget(t *testing.T) {
-	tests := []struct {
-		name    string
-		target  string
-		wantErr string
-	}{
-		{name: "空地址", target: "", wantErr: "scheme"},
-		{name: "非法 scheme", target: "tcp://127.0.0.1:9001", wantErr: "scheme"},
-		{name: "缺少主机名", target: "http:///api", wantErr: "缺少主机名"},
-		{name: "包含非法字符", target: "http://127.0.0.1:9001/%zz", wantErr: "解析后端地址"},
-	}
+func TestNewRejectsNilDependencies(t *testing.T) {
+	backends := []*backend.Backend{testBackend(t, "http://127.0.0.1:9001", 1)}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(tc.target, discardLogger())
-			if err == nil {
-				t.Fatalf("target=%q 期望报错，实际通过", tc.target)
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("错误信息未包含 %q，实际: %v", tc.wantErr, err)
-			}
-		})
+	if _, err := New(nil, backend.NewRegistry(backends...), discardLogger()); err == nil {
+		t.Error("负载均衡器为 nil 时应报错")
+	}
+	if _, err := New(balancer.NewRoundRobin(backends), nil, discardLogger()); err == nil {
+		t.Error("注册表为 nil 时应报错")
 	}
 }
 
@@ -102,14 +111,12 @@ func TestForwardsRequestAndSetsForwardedHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New(upstream.URL, discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	handler := newTestHandler(t, testBackend(t, upstream.URL, 1))
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodPost, "http://proxy.example.com/api/users?page=2", strings.NewReader(`{"name":"lee"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "1.2.3.4") // 客户端伪造的转发头应被丢弃
 	w := newRecorder()
 	router.ServeHTTP(w, req)
 
@@ -146,6 +153,9 @@ func TestForwardsRequestAndSetsForwardedHeaders(t *testing.T) {
 	if got := gotHeader.Get("X-Forwarded-For"); !strings.Contains(got, "192.0.2.1") {
 		t.Errorf("X-Forwarded-For = %q, 期望包含客户端 IP 192.0.2.1", got)
 	}
+	if got := gotHeader.Get("X-Forwarded-For"); strings.Contains(got, "1.2.3.4") {
+		t.Errorf("X-Forwarded-For = %q, 客户端伪造的值应被丢弃", got)
+	}
 }
 
 func TestPreservesEncodedPath(t *testing.T) {
@@ -155,15 +165,11 @@ func TestPreservesEncodedPath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New(upstream.URL, discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	handler := newTestHandler(t, testBackend(t, upstream.URL, 1))
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/files/a%2Fb/c.txt", nil)
-	w := newRecorder()
-	router.ServeHTTP(w, req)
+	router.ServeHTTP(newRecorder(), req)
 
 	if gotRequestURI != "/files/a%2Fb/c.txt" {
 		t.Errorf("后端收到 RequestURI = %q, 期望 \"/files/a%%2Fb/c.txt\"（%%2F 不应被二次解码）", gotRequestURI)
@@ -177,10 +183,7 @@ func TestPreservesBackendBasePath(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New(upstream.URL+"/base", discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	handler := newTestHandler(t, testBackend(t, upstream.URL+"/base", 1))
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/svc", nil)
@@ -191,15 +194,43 @@ func TestPreservesBackendBasePath(t *testing.T) {
 	}
 }
 
+func TestDistributesRequestsRoundRobin(t *testing.T) {
+	newUpstream := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Instance", name)
+			_, _ = w.Write([]byte(name))
+		}))
+	}
+	first, second := newUpstream("backend-a"), newUpstream("backend-b")
+	defer first.Close()
+	defer second.Close()
+
+	handler := newTestHandler(t,
+		testBackend(t, first.URL, 1),
+		testBackend(t, second.URL, 1),
+	)
+	router := newTestRouter(t, handler)
+
+	var got []string
+	for i := 0; i < 4; i++ {
+		w := newRecorder()
+		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/ping", nil))
+		got = append(got, w.Header().Get("X-Instance"))
+	}
+
+	want := []string{"backend-a", "backend-b", "backend-a", "backend-b"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("轮询顺序 = %v, 期望 %v", got, want)
+	}
+}
+
 func TestReturnsBadGatewayWhenUpstreamUnreachable(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	target := upstream.URL
 	upstream.Close() // 立刻关闭，制造必然连不上的后端
 
-	handler, err := New(target, discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	instance := testBackend(t, target, 1)
+	handler := newTestHandler(t, instance)
 	router := newTestRouter(t, handler)
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/anything", nil)
@@ -220,6 +251,43 @@ func TestReturnsBadGatewayWhenUpstreamUnreachable(t *testing.T) {
 	if payload["error"] != "bad gateway" {
 		t.Errorf("响应中的 error = %q, 期望 \"bad gateway\"", payload["error"])
 	}
+
+	stats := instance.Stats()
+	if stats.Requests != 1 {
+		t.Errorf("请求计数 = %d, 期望 1", stats.Requests)
+	}
+	if stats.Failures != 1 {
+		t.Errorf("失败计数 = %d, 期望 1（转发失败应记账）", stats.Failures)
+	}
+}
+
+func TestReturnsServiceUnavailableWhenNoHealthyBackend(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	instance := testBackend(t, upstream.URL, 1)
+	handler := newTestHandler(t, instance)
+	router := newTestRouter(t, handler)
+
+	instance.SetAlive(false)
+
+	w := newRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://proxy.example.com/anything", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 = %d, 期望 503", w.Code)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("响应体不是合法 JSON: %v, 原始内容: %s", err, w.Body.String())
+	}
+	if payload["error"] != "no healthy backend" {
+		t.Errorf("响应中的 error = %v, 期望 \"no healthy backend\"", payload["error"])
+	}
+	if payload["total_backends"] != float64(1) {
+		t.Errorf("响应中的 total_backends = %v, 期望 1", payload["total_backends"])
+	}
 }
 
 func TestHandleWritesUpstreamToContext(t *testing.T) {
@@ -228,18 +296,16 @@ func TestHandleWritesUpstreamToContext(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New(upstream.URL, discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	instance := testBackend(t, upstream.URL, 1)
+	handler := newTestHandler(t, instance)
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.UseRawPath = true
 	router.Any("/*path", func(c *gin.Context) {
 		handler.Handle(c)
-		if got := c.GetString(CtxKeyUpstream); got != handler.Target() {
-			t.Errorf("上下文中的 upstream = %q, 期望 %q", got, handler.Target())
+		if got := c.GetString(CtxKeyUpstream); got != instance.String() {
+			t.Errorf("上下文中的 upstream = %q, 期望 %q", got, instance.String())
 		}
 	})
 
@@ -253,10 +319,7 @@ func TestServeHTTPWorksWithoutGin(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	handler, err := New(upstream.URL, discardLogger())
-	if err != nil {
-		t.Fatalf("构造处理器失败: %v", err)
-	}
+	handler := newTestHandler(t, testBackend(t, upstream.URL, 1))
 
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/plain", nil).WithContext(context.Background())
 	w := httptest.NewRecorder()

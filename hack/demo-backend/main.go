@@ -3,6 +3,8 @@
 // 用法：
 //
 //	go run ./hack/demo-backend -addr :9001 -name backend-a
+//	go run ./hack/demo-backend -addr :9001 -name backend-a -delay 2s   # 慢实例（验证超时与重试）
+//	go run ./hack/demo-backend -addr :9001 -name backend-a -status 503 # 故障实例（验证重试与健康检查）
 //
 // 支持的请求参数：
 //
@@ -32,6 +34,8 @@ const maxEchoBody = 1 << 20
 func main() {
 	addr := flag.String("addr", ":9001", "监听地址")
 	name := flag.String("name", "backend", "实例名，用于回显与日志前缀")
+	delay := flag.Duration("delay", 0, "每个请求固定延迟该时长后响应（模拟慢实例）")
+	status := flag.Int("status", 0, "所有请求固定返回该状态码（模拟故障实例，0 表示正常）")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -40,7 +44,7 @@ func main() {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		echo(*name, w, r)
+		echo(*name, *delay, *status, w, r)
 	})
 
 	srv := &http.Server{
@@ -55,26 +59,34 @@ func main() {
 	}
 }
 
-// echo 回显请求信息，并支持 sleep / status 两个调试参数。
-func echo(name string, w http.ResponseWriter, r *http.Request) {
+// echo 回显请求信息，并支持 delay/status/sleep 等调试开关。
+func echo(name string, fixedDelay time.Duration, fixedStatus int, w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
+	delay := fixedDelay
 	if d := query.Get("sleep"); d != "" {
-		if dur, err := time.ParseDuration(d); err == nil {
-			fmt.Fprintf(os.Stderr, "[%s] %s %s 延迟 %s 后响应\n", name, r.Method, r.RequestURI, dur)
-			time.Sleep(dur)
+		if parsed, err := time.ParseDuration(d); err == nil {
+			delay = parsed
 		}
 	}
+	if delay > 0 {
+		fmt.Fprintf(os.Stderr, "[%s] %s %s 延迟 %s 后响应\n", name, r.Method, r.RequestURI, delay)
+		time.Sleep(delay)
+	}
 
+	status := fixedStatus
 	if s := query.Get("status"); s != "" {
-		code, err := strconv.Atoi(s)
-		if err != nil || code < 100 || code > 599 {
+		parsed, err := strconv.Atoi(s)
+		if err != nil || parsed < 100 || parsed > 599 {
 			http.Error(w, "invalid status", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "[%s] %s %s -> %d\n", name, r.Method, r.RequestURI, code)
-		w.WriteHeader(code)
-		_, _ = fmt.Fprintf(w, "%s: %d\n", name, code)
+		status = parsed
+	}
+	if status != 0 {
+		fmt.Fprintf(os.Stderr, "[%s] %s %s -> %d\n", name, r.Method, r.RequestURI, status)
+		w.WriteHeader(status)
+		_, _ = fmt.Fprintf(w, "%s: %d\n", name, status)
 		return
 	}
 

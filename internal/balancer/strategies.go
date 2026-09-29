@@ -23,12 +23,12 @@ func NewRoundRobin(backends []*backend.Backend) Balancer {
 func (r *roundRobin) Name() string { return NameRoundRobin }
 
 // Next 实现 Balancer。
-func (r *roundRobin) Next() *backend.Backend {
-	healthy := healthyCount(r.backends)
-	if healthy == 0 {
+func (r *roundRobin) Next(exclude ...*backend.Backend) *backend.Backend {
+	available := availableCount(r.backends, exclude)
+	if available == 0 {
 		return nil
 	}
-	return pickNth(r.backends, int(r.counter.Add(1)-1)%healthy)
+	return pickNthAvailable(r.backends, int(r.counter.Add(1)-1)%available, exclude)
 }
 
 // indexPicker 返回 [0, n) 区间内的下标，便于测试注入确定性实现。
@@ -54,12 +54,12 @@ func newRandom(backends []*backend.Backend, pick indexPicker) Balancer {
 func (r *random) Name() string { return NameRandom }
 
 // Next 实现 Balancer。
-func (r *random) Next() *backend.Backend {
-	healthy := healthyCount(r.backends)
-	if healthy == 0 {
+func (r *random) Next(exclude ...*backend.Backend) *backend.Backend {
+	available := availableCount(r.backends, exclude)
+	if available == 0 {
 		return nil
 	}
-	return pickNth(r.backends, r.pick(healthy))
+	return pickNthAvailable(r.backends, r.pick(available), exclude)
 }
 
 // weightedRoundRobin 平滑加权轮询（nginx 同款算法）。
@@ -84,7 +84,7 @@ func NewWeightedRoundRobin(backends []*backend.Backend) Balancer {
 func (w *weightedRoundRobin) Name() string { return NameWeightedRoundRobin }
 
 // Next 实现 Balancer。
-func (w *weightedRoundRobin) Next() *backend.Backend {
+func (w *weightedRoundRobin) Next(exclude ...*backend.Backend) *backend.Backend {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -93,6 +93,10 @@ func (w *weightedRoundRobin) Next() *backend.Backend {
 	for i, b := range w.backends {
 		if !b.Alive() {
 			w.current[i] = 0 // 下线实例不参与竞争，恢复后从 0 重新累计
+			continue
+		}
+		if excluded(b, exclude) {
+			// 临时排除（本次重试已试过）：不累加也不清零，保留平滑轮询的进度
 			continue
 		}
 		w.current[i] += b.Weight()

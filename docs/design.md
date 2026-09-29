@@ -45,7 +45,7 @@
 flowchart TB
     subgraph L1["接入层"]
         G["Gin 引擎<br/>Any(/*path) + NoRoute 兜底<br/>UseRawPath 保留原始编码"]
-        MW["中间件链<br/>Recovery → AccessLog"]
+        MW["中间件链<br/>Recovery → AccessLog → RateLimit"]
     end
     subgraph L2["转发层"]
         H["proxy.Handler<br/>尝试循环 / 单次超时 / 重试决策"]
@@ -100,8 +100,20 @@ flowchart LR
 | `internal/balancer` | 三种负载均衡策略，支持排除已尝试实例 | `Balancer`、`roundRobin`、`random`、`weightedRoundRobin` |
 | `internal/health` | 主动定时探测 + 被动失败上报，阈值防抖地维护存活状态 | `Checker` |
 | `internal/proxy` | 转发内核：逐请求选实例、单次超时、换实例重试、错误回写 | `Handler`、`Options`、`attemptState` |
-| `internal/middleware` | 访问日志（Gin 中间件） | `AccessLog` |
+| `internal/middleware` | 访问日志与令牌桶限流（Gin 中间件） | `AccessLog`、`RateLimit` |
 | `cmd/proxy` | 入口：命令行解析、依赖装配、监听与优雅退出 | `options`、`run` |
+
+### 2.4 限流
+
+限流是中间件链上的一环（`Recovery → AccessLog → RateLimit`），因此被限流拒绝的请求
+同样会进入访问日志。实现基于 `golang.org/x/time/rate` 的令牌桶：
+
+- `by=global` 共享一个桶；`by=ip` 每个客户端 IP 一个桶；
+- 桶按空闲时长回收（10 分钟），且总数有上限（10000），避免大量来源 IP 把内存撑爆；
+  超过上限时先回收空闲桶，仍不够则淘汰最久未使用的桶；
+- **不信任 `X-Forwarded-For`**（`SetTrustedProxies(nil)`）：客户端 IP 取真实 TCP 来源，
+  否则伪造头部就能换一个新桶绕过限流；
+- 配置非法（`rps <= 0` 或 `burst < 1`）时跳过限流并打警告，而不是把请求全部拒绝（fail-open）。
 
 ## 三、配置格式
 
@@ -124,7 +136,10 @@ flowchart LR
 | `retry.per_try_timeout` | duration | `3s` | 单次尝试超时，必须 > 0 |
 | `retry.retry_on_status` | list | `[502,503,504]` | 命中即换实例重试，取值 100–599 |
 | `retry.retry_non_idempotent` | bool | `false` | 是否允许非幂等方法完整重试 |
-| `rate_limit.*` | - | 关闭 | 见第十一章（阶段 8 实现） |
+| `rate_limit.enabled` | bool | `false` | 是否启用令牌桶限流 |
+| `rate_limit.rps` | float | `1000` | 每秒补充的令牌数（平均速率上限），启用时必须 > 0 |
+| `rate_limit.burst` | int | `200` | 桶容量（允许的瞬时突发量），启用时必须 ≥ 1 |
+| `rate_limit.by` | string | `ip` | `ip` 每个客户端一个桶 / `global` 全局共用一个桶 |
 | `logging.level` | string | `info` | `debug` / `info` / `warn` / `error` |
 | `logging.format` | string | `json` | `json` / `text` |
 | `logging.access_log` | bool | `true` | 是否输出访问日志 |
@@ -336,6 +351,7 @@ stateDiagram-v2
 | 场景 | 状态码 | 响应体 |
 | --- | --- | --- |
 | 无任何存活实例 | `503` | `{"error":"no healthy backend","total_backends":N}` |
+| 触发限流 | `429` | `{"error":"too many requests","scope":"ip","retry_after":1}` + `Retry-After` 头 |
 | 单次尝试超时 | `504` | `{"error":"gateway timeout","upstream":"..."}` |
 | 连接失败等其余转发错误 | `502` | `{"error":"bad gateway","upstream":"..."}` |
 | 各种尝试均失败且是状态码触发 | `502` | `{"error":"bad gateway","upstream":"...","last_status":503}` |
@@ -409,6 +425,7 @@ Gin 只承担路由与中间件（`Any("/*path")` + `NoRoute` 兜底），转发
 | 健康检查 | 阈值剔除与恢复、探测路径与状态码判定、超时、主动被动共用计数、禁用时空操作、`Run` 启停 |
 | 转发内核 | 请求透传、编码路径、基础路径、转发头、502/503/504、重试与排除、幂等性、请求体重放、超大体不重试 |
 | 访问日志 | 字段完整性、5xx 提升为 WARN、含引号查询串不破坏单行 JSON |
+| 限流 | 突发后拒绝与 `Retry-After`、按 IP 隔离、伪造 XFF 无效、令牌补充、空闲桶回收、桶数上限 |
 | CLI | 参数解析、帮助、版本、配置摘要、三种动作与错误路径 |
 
 运行方式：
@@ -425,8 +442,7 @@ go test ./... -cover     # 覆盖率
 | 后端列表静态 | 仅来自配置文件，不支持运行时增删；`Registry` 已按"构造后不变"设计，扩展时需要补锁 |
 | 健康检查状态不持久 | 进程重启后所有实例回到乐观存活，靠首轮探测纠正 |
 | 无分布式协调 | 多代理实例各自探测，不共享健康状态 |
-| 限流未实现 | `rate_limit` 配置项已预留（阶段 8 落地：令牌桶，按 IP 或全局） |
-| 未提供容器化 | Dockerfile / docker-compose 在阶段 8 |
+| 未提供容器化 | Dockerfile / docker-compose 在后续阶段补充 |
 | 无 TLS 终止 | 上游为 http/https 均可转发，但代理自身只提供 HTTP 监听 |
 
 **演进方向**：限流（令牌桶）→ Docker 部署 → 可选的管理接口（暴露实例状态与流量统计）。

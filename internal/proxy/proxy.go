@@ -32,16 +32,23 @@ const (
 // targetCtxKey 是在请求 context 中携带本次选中后端实例的键。
 type targetCtxKey struct{}
 
+// HealthReporter 接收转发失败通知，由健康检查器实现。
+// 允许为 nil，表示不启用被动健康检查。
+type HealthReporter interface {
+	ReportFailure(b *backend.Backend)
+}
+
 // Handler 把收到的 HTTP 请求转发到负载均衡器选出的后端实例。
 type Handler struct {
 	balancer balancer.Balancer
 	registry *backend.Registry
+	reporter HealthReporter
 	proxy    *httputil.ReverseProxy
 	logger   *slog.Logger
 }
 
-// New 构造转发处理器。
-func New(lb balancer.Balancer, registry *backend.Registry, logger *slog.Logger) (*Handler, error) {
+// New 构造转发处理器。reporter 可为 nil。
+func New(lb balancer.Balancer, registry *backend.Registry, reporter HealthReporter, logger *slog.Logger) (*Handler, error) {
 	if lb == nil {
 		return nil, errors.New("负载均衡器不能为空")
 	}
@@ -52,7 +59,7 @@ func New(lb balancer.Balancer, registry *backend.Registry, logger *slog.Logger) 
 		logger = slog.Default()
 	}
 
-	h := &Handler{balancer: lb, registry: registry, logger: logger}
+	h := &Handler{balancer: lb, registry: registry, reporter: reporter, logger: logger}
 
 	rp := &httputil.ReverseProxy{
 		// 用 Rewrite（Go 1.20+）而不是 Director：它会先丢弃客户端伪造的
@@ -130,17 +137,24 @@ func (h *Handler) handleUpstreamError(w http.ResponseWriter, req *http.Request, 
 	upstream := "unknown"
 	if target != nil {
 		upstream = target.String()
-		target.RecordFailure() // 累计失败次数，供健康检查与统计使用
 	}
 
-	// 客户端主动取消请求不是后端故障，无需回写响应
-	if errors.Is(err, context.Canceled) {
+	// 客户端主动断开导致请求 context 被取消：不是后端故障，
+	// 既不回写响应，也不计入失败统计（否则会误抳后端）
+	if errors.Is(err, context.Canceled) && req.Context().Err() != nil {
 		h.logger.Debug("客户端取消请求",
 			"method", req.Method,
 			"path", req.URL.Path,
 			"upstream", upstream,
 		)
 		return
+	}
+
+	if target != nil {
+		target.RecordFailure() // 累计失败次数，供统计使用
+		if h.reporter != nil {
+			h.reporter.ReportFailure(target) // 通知健康检查器，参与连续失败计数
+		}
 	}
 
 	h.logger.Warn("转发失败",

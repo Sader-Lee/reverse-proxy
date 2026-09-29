@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -51,10 +52,16 @@ func testBackend(t *testing.T, rawURL string, weight int) *backend.Backend {
 	return b
 }
 
-// newTestHandler 用给定后端构造轮询策略的处理器。
+// newTestHandler 用给定后端构造轮询策略的处理器（不接健康检查）。
 func newTestHandler(t *testing.T, backends ...*backend.Backend) *Handler {
 	t.Helper()
-	h, err := New(balancer.NewRoundRobin(backends), backend.NewRegistry(backends...), discardLogger())
+	return newTestHandlerWithReporter(t, nil, backends...)
+}
+
+// newTestHandlerWithReporter 允许注入失败上报器。
+func newTestHandlerWithReporter(t *testing.T, reporter HealthReporter, backends ...*backend.Backend) *Handler {
+	t.Helper()
+	h, err := New(balancer.NewRoundRobin(backends), backend.NewRegistry(backends...), reporter, discardLogger())
 	if err != nil {
 		t.Fatalf("构造处理器失败: %v", err)
 	}
@@ -78,10 +85,10 @@ func newTestRouter(t *testing.T, handler *Handler) *gin.Engine {
 func TestNewRejectsNilDependencies(t *testing.T) {
 	backends := []*backend.Backend{testBackend(t, "http://127.0.0.1:9001", 1)}
 
-	if _, err := New(nil, backend.NewRegistry(backends...), discardLogger()); err == nil {
+	if _, err := New(nil, backend.NewRegistry(backends...), nil, discardLogger()); err == nil {
 		t.Error("负载均衡器为 nil 时应报错")
 	}
-	if _, err := New(balancer.NewRoundRobin(backends), nil, discardLogger()); err == nil {
+	if _, err := New(balancer.NewRoundRobin(backends), nil, nil, discardLogger()); err == nil {
 		t.Error("注册表为 nil 时应报错")
 	}
 }
@@ -327,5 +334,63 @@ func TestServeHTTPWorksWithoutGin(t *testing.T) {
 
 	if w.Code != http.StatusOK || w.Body.String() != "plain" {
 		t.Errorf("直接使用 http.Handler 时转发失败: code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// fakeReporter 记录收到的转发失败通知。
+type fakeReporter struct {
+	mu       sync.Mutex
+	failures []*backend.Backend
+}
+
+func (f *fakeReporter) ReportFailure(b *backend.Backend) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failures = append(f.failures, b)
+}
+
+func (f *fakeReporter) reported() []*backend.Backend {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*backend.Backend(nil), f.failures...)
+}
+
+func TestReportsForwardFailureToReporter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	target := upstream.URL
+	upstream.Close()
+
+	instance := testBackend(t, target, 1)
+	reporter := &fakeReporter{}
+	handler := newTestHandlerWithReporter(t, reporter, instance)
+
+	router := newTestRouter(t, handler)
+	router.ServeHTTP(newRecorder(), httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil))
+
+	reported := reporter.reported()
+	if len(reported) != 1 || reported[0] != instance {
+		t.Errorf("上报的失败实例 = %v, 期望恰好一次且为 %s", reported, instance.String())
+	}
+}
+
+func TestDoesNotCountClientCancellationAsFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer upstream.Close()
+
+	instance := testBackend(t, upstream.URL, 1)
+	reporter := &fakeReporter{}
+	handler := newTestHandlerWithReporter(t, reporter, instance)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.example.com/x", nil).WithContext(ctx)
+
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got := reporter.reported(); len(got) != 0 {
+		t.Errorf("客户端取消不应上报后端失败，实际上报 %d 次", len(got))
+	}
+	if stats := instance.Stats(); stats.Failures != 0 {
+		t.Errorf("客户端取消不应计入失败统计，实际 %d 次", stats.Failures)
 	}
 }

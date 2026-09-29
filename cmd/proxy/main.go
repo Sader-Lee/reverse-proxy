@@ -1,7 +1,7 @@
 // Command proxy 是反向代理与负载均衡器的入口。
 //
-// 阶段 2：基于 Gin + httputil.ReverseProxy，按配置的负载均衡策略把请求分发到
-// 多个后端实例；健康检查与超时重试在后续阶段接入。
+// 阶段 3：在负载均衡的基础上加入后端健康检查（主动探测 + 转发失败被动上报），
+// 实例被剔除后自动跳过，恢复后重新加入；超时与重试在后续阶段接入。
 package main
 
 import (
@@ -23,6 +23,7 @@ import (
 	"github.com/Sader-Lee/reverse-proxy/internal/backend"
 	"github.com/Sader-Lee/reverse-proxy/internal/balancer"
 	"github.com/Sader-Lee/reverse-proxy/internal/config"
+	"github.com/Sader-Lee/reverse-proxy/internal/health"
 	"github.com/Sader-Lee/reverse-proxy/internal/middleware"
 	"github.com/Sader-Lee/reverse-proxy/internal/proxy"
 )
@@ -62,9 +63,18 @@ func run() error {
 		return err
 	}
 
-	handler, err := proxy.New(lb, registry, logger)
+	checker := health.New(registry, cfg.HealthCheck, logger)
+
+	handler, err := proxy.New(lb, registry, checker, logger)
 	if err != nil {
 		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if checker.Enabled() {
+		go checker.Run(ctx)
 	}
 
 	listener, err := net.Listen("tcp", cfg.Listen)
@@ -87,7 +97,7 @@ func run() error {
 		"strategy", lb.Name(),
 		"backends", registry.Len(),
 		"healthy", registry.HealthyLen(),
-		"health_check", cfg.HealthCheck.Enabled,
+		"health_check", checker.Enabled(),
 		"config", *configPath,
 	)
 
@@ -97,9 +107,6 @@ func run() error {
 			serveErr <- err
 		}
 	}()
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	select {
 	case err := <-serveErr:

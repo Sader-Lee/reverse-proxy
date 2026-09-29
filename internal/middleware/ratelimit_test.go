@@ -228,9 +228,13 @@ func TestTokenLimiterEvictionPrefersIdleBuckets(t *testing.T) {
 func TestTokenLimiterEvictsLeastRecentlyUsed(t *testing.T) {
 	limiter := newTokenLimiter(10, 5, 3)
 
+	// 三个桶的最后使用时刻必须互不相同：
+	// 若存在并列，map 迭代顺序随机 + sort.Slice 不稳定会让"淘汰谁"变得不确定
 	base := time.Now()
 	limiter.now = func() time.Time { return base }
 	limiter.allow("oldest")
+
+	limiter.now = func() time.Time { return base.Add(30 * time.Second) }
 	limiter.allow("middle")
 
 	limiter.now = func() time.Time { return base.Add(time.Minute) }
